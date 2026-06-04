@@ -17,6 +17,7 @@ Datasets:
   toolace
   openr1_math
   scienceqa
+  medmcqa
   taco
 
 Common environment overrides:
@@ -59,7 +60,7 @@ esac
 
 DATASET_NAME="$(basename "${DATASET_INPUT}")"
 case "${DATASET_NAME}" in
-  apigen|toolace|openr1_math|scienceqa|taco)
+  apigen|toolace|openr1_math|scienceqa|medmcqa|taco)
     ;;
   *)
     echo "ERROR: unsupported dataset: ${DATASET_INPUT}" >&2
@@ -118,7 +119,7 @@ SAVE_FREQ="${SAVE_FREQ:-50}"
 MAX_CKPTS="${MAX_CKPTS:-20}"
 # 快速迭代数据集默认从训练集随机采样 6400 条；设为 -1 可恢复全量训练。
 case "${DATASET_NAME}" in
-  apigen|toolace|openr1_math|taco)
+  apigen|toolace|openr1_math|medmcqa|taco)
     TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:-6400}"
     ;;
 esac

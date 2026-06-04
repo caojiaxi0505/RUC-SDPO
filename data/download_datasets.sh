@@ -34,6 +34,13 @@ python data/convert_rlvr_datasets.py \
   --base-dir datasets \
   --backend hf
 
+# 下载medmcqa数据集
+
+python data/convert_rlvr_datasets.py \
+  --datasets medmcqa \
+  --base-dir datasets \
+  --backend hf
+
 # 下载taco数据集
 
 python data/convert_rlvr_datasets.py \

@@ -16,6 +16,7 @@ DATASET_SPECS = {
     "openr1_math": ("open-r1/OpenR1-Math-220k", "all", "train"),
     "taco": ("DONG19/TACO", "ALL", "train"),
     "scienceqa": ("derek-thomas/ScienceQA", "default", "train"),
+    "medmcqa": ("openlifescienceai/medmcqa", "default", "train"),
 }
 
 HF_COLUMNS = {
@@ -32,6 +33,7 @@ HF_COLUMNS = {
         "category",
         "grade",
     ],
+    "medmcqa": ["id", "question", "opa", "opb", "opc", "opd", "cop", "choice_type", "exp", "subject_name", "topic_name"],
 }
 
 DEFAULT_CODE_TEST_LIMIT = -1  # <= 0 means keep all TACO tests.
@@ -342,6 +344,26 @@ def make_scienceqa_prompt(row: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def make_medmcqa_prompt(row: dict[str, Any]) -> str:
+    choices = [str(row.get(key, "") or "").strip() for key in ["opa", "opb", "opc", "opd"]]
+    if any(not choice for choice in choices):
+        raise ValueError("missing_choices")
+
+    lines = [
+        "Answer the following medical science multiple-choice question.",
+        "You may reason briefly, but the final answer must be exactly in this format: <answer>X</answer>.",
+        "X must be one of the option letters.",
+        "",
+        "Question:",
+        str(row.get("question", "")).strip(),
+        "",
+        "Choices:",
+    ]
+    for idx, choice in enumerate(choices):
+        lines.append(f"{option_letter(idx)}. {choice}")
+    return "\n".join(lines)
+
+
 # ----------------------------- converters ----------------------------------
 
 
@@ -486,6 +508,56 @@ def convert_scienceqa_row(wrapped: dict[str, Any], split: str, *, include_images
     )
 
 
+def medmcqa_answer_letter(value: Any) -> str:
+    if isinstance(value, int):
+        # Hugging Face exposes MedMCQA `cop` as a 0-based ClassLabel: 0=a, 1=b, 2=c, 3=d.
+        return option_letter(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        raise ValueError("missing_answer")
+    if text in {"a", "b", "c", "d"}:
+        return text.upper()
+
+    parts = text.split()
+    if len(parts) >= 2 and parts[1] in {"a", "b", "c", "d"}:
+        return parts[1].upper()
+    if parts[0].isdigit():
+        answer_idx = int(parts[0])
+        if 0 <= answer_idx < 4:
+            return option_letter(answer_idx)
+        if 1 <= answer_idx <= 4:
+            return option_letter(answer_idx - 1)
+
+    raise ValueError("bad_answer")
+
+
+def convert_medmcqa_row(wrapped: dict[str, Any], split: str) -> dict[str, Any]:
+    row = wrapped["row"]
+    question = str(row.get("question", "")).strip()
+    if not question:
+        raise ValueError("missing_question")
+
+    source_id = str(row.get("id") or f"medmcqa-{wrapped.get('row_idx')}")
+    choices = [row.get(key, "") for key in ["opa", "opb", "opc", "opd"]]
+    return make_verl_row(
+        data_source="medmcqa",
+        prompt=make_medmcqa_prompt(row),
+        ability="mcq",
+        ground_truth=medmcqa_answer_letter(row.get("cop")),
+        source_dataset="medmcqa",
+        source_id=source_id,
+        split=split,
+        extra_info={
+            "subject": row.get("subject_name", ""),
+            "topic": row.get("topic_name", ""),
+            "choice_type": row.get("choice_type", ""),
+            "num_choices": len(choices),
+            "source_hf_split": wrapped.get("source_hf_split", ""),
+        },
+    )
+
+
 def convert_row(dataset_name: str, wrapped: dict[str, Any], split: str, args: argparse.Namespace) -> dict[str, Any]:
     if dataset_name == "openr1_math":
         return convert_openr1_math_row(wrapped, split)
@@ -493,6 +565,8 @@ def convert_row(dataset_name: str, wrapped: dict[str, Any], split: str, args: ar
         return convert_taco_row(wrapped, split, max_code_tests=args.max_code_tests)
     if dataset_name == "scienceqa":
         return convert_scienceqa_row(wrapped, split, include_images=args.scienceqa_include_images)
+    if dataset_name == "medmcqa":
+        return convert_medmcqa_row(wrapped, split)
     raise ValueError(f"unknown_dataset:{dataset_name}")
 
 
@@ -510,6 +584,10 @@ def add_prompt_stats(stats: Counter, prompt_lengths: list[int]) -> None:
 
 
 def convert_dataset(dataset_name: str, args: argparse.Namespace) -> None:
+    if dataset_name == "medmcqa":
+        convert_medmcqa_dataset(args)
+        return
+
     hf_dataset, config, hf_split = DATASET_SPECS[dataset_name]
     out_dir = args.base_dir / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -575,13 +653,77 @@ def convert_dataset(dataset_name: str, args: argparse.Namespace) -> None:
         print(f"  {key}={stats[key]}")
 
 
+def convert_medmcqa_dataset(args: argparse.Namespace) -> None:
+    dataset_name = "medmcqa"
+    hf_dataset, config, _ = DATASET_SPECS[dataset_name]
+    out_dir = args.base_dir / dataset_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = out_dir / "train.jsonl"
+    test_path = out_dir / "test.jsonl"
+    meta_path = out_dir / "conversion_meta.json"
+
+    stats: Counter = Counter()
+    prompt_lengths: list[int] = []
+    seen_ids: set[str] = set()
+    split_plan = [("train", "train", train_path), ("test", args.medmcqa_test_split, test_path)]
+
+    for output_split, hf_split, output_path in split_plan:
+        with output_path.open("w", encoding="utf-8") as out_f:
+            for wrapped in iter_dataset_rows(
+                dataset_name=dataset_name,
+                dataset=hf_dataset,
+                config=config,
+                split=hf_split,
+                page_size=args.page_size,
+                max_samples=args.max_samples,
+                request_sleep=args.request_sleep,
+                backend=args.backend,
+            ):
+                wrapped["source_hf_split"] = hf_split
+                try:
+                    out = convert_medmcqa_row(wrapped, output_split)
+                    source_id = f"{hf_split}:{out['extra_info']['source_id']}"
+                    if source_id in seen_ids:
+                        raise ValueError("duplicate_source_id")
+                    seen_ids.add(source_id)
+                except Exception as exc:
+                    reason = str(exc).split(": ", 1)[-1].replace(" ", "_")
+                    stats[f"skip/{output_split}/{reason}"] += 1
+                    continue
+
+                prompt_lengths.append(len(out["prompt"][0]["content"]))
+                write_jsonl_row(out_f, out)
+                stats[f"keep/{output_split}"] += 1
+                stats["keep/rows"] += 1
+                if stats["keep/rows"] % 10000 == 0:
+                    print(f"{dataset_name}: converted {stats['keep/rows']} rows")
+
+    add_prompt_stats(stats, prompt_lengths)
+    meta = {
+        "dataset": dataset_name,
+        "hf_dataset": hf_dataset,
+        "hf_config": config,
+        "hf_train_split": "train",
+        "hf_test_split": args.medmcqa_test_split,
+        "max_samples": args.max_samples,
+        "backend": args.backend,
+        "stats": dict(sorted(stats.items())),
+    }
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    print(f"{dataset_name}: wrote {train_path} and {test_path}")
+    for key in sorted(stats):
+        print(f"  {key}={stats[key]}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download and convert RLVR datasets into verl JSONL schema.")
     parser.add_argument(
         "--datasets",
         nargs="+",
         default=["all"],
-        choices=["all", "openr1_math", "taco", "scienceqa"],
+        choices=["all", "openr1_math", "taco", "scienceqa", "medmcqa"],
         help="Datasets to download and convert.",
     )
     parser.add_argument("--base-dir", type=Path, default=Path("datasets"), help="Output dataset directory.")
@@ -607,6 +749,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep ScienceQA rows with images. Default skips them for text-only training.",
     )
+    parser.add_argument(
+        "--medmcqa-test-split",
+        choices=["validation", "test"],
+        default="validation",
+        help="Official MedMCQA split written to test.jsonl. Default uses validation for training-time eval.",
+    )
     return parser.parse_args()
 
 
@@ -616,7 +764,7 @@ def main() -> None:
         raise ValueError(f"val_ratio must be in [0, 1), got {args.val_ratio}")
 
     selected = set(DATASET_SPECS) if "all" in args.datasets else set(args.datasets)
-    for dataset_name in ["openr1_math", "taco", "scienceqa"]:
+    for dataset_name in ["openr1_math", "taco", "scienceqa", "medmcqa"]:
         if dataset_name in selected:
             convert_dataset(dataset_name, args)
 
