@@ -27,6 +27,7 @@ Common environment overrides:
   TRAIN_BATCH_SIZE, PPO_MINI_BATCH_SIZE, ROLLOUT_N, VAL_N
   LR, LR_WARMUP_STEPS, TOTAL_EPOCHS, TEST_FREQ, SAVE_FREQ
   TRAIN_MAX_SAMPLES, VAL_MAX_SAMPLES, DATA_SEED, DATA_SHUFFLE
+  VAL_BEFORE_TRAIN
   JF_POLICY, UPLIFT_AGGREGATION, UPLIFT_NUM_SAMPLES
   AUXILIARY_COEF, ALPHA, DISTILLATION_TOPK
 EOF
@@ -126,6 +127,7 @@ esac
 # 快速迭代默认只从 test.jsonl 中采样 64 条做 validation；设为 -1 可恢复全量验证。
 VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-64}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-True}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 
 COMMON_ARGS=(
   "vars.dir=${PROJECT_DIR}"
@@ -152,6 +154,7 @@ COMMON_ARGS=(
   "algorithm.rollout_correction.rollout_is=token"
   "trainer.total_epochs=${TOTAL_EPOCHS}"
   "trainer.test_freq=${TEST_FREQ}"
+  "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
   "trainer.save_freq=${SAVE_FREQ}"
   "trainer.max_actor_ckpt_to_keep=${MAX_CKPTS}"
   "trainer.default_local_dir=${CKPT_DIR}"
