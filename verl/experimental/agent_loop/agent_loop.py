@@ -41,6 +41,7 @@ from verl.utils.chat_template import initialize_system_prompt
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
@@ -48,7 +49,7 @@ from verl.utils.rollout_trace import (
     rollout_trace_op,
 )
 from verl.utils.transferqueue_utils import tqbridge
-from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
+from verl.workers.rollout.replica import RolloutMode, TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -481,6 +482,122 @@ class AgentLoopWorker:
 
         return output
 
+    @tqbridge()
+    async def generate_sequences_from_tokens(self, batch: DataProto) -> DataProto:
+        """直接用已经 tokenized 的 prompt 调 async rollout server 生成。
+
+        该路径比通用 AgentLoop 更窄：不会重新 apply chat template，也不会注入 tool schema。
+        RUC-SDPO 用它从 trainer 构造好的 teacher-conditioned prompt tensor 精确估计 J_f。
+        """
+        unsupported_multimodal_keys = {
+            "multi_modal_inputs",
+            "multi_modal_data",
+            "image_data",
+            "video_data",
+        } & set(batch.non_tensor_batch.keys())
+        if unsupported_multimodal_keys:
+            raise ValueError(
+                "generate_sequences_from_tokens only supports token-only prompts, "
+                f"but got multi-modal keys: {sorted(unsupported_multimodal_keys)}"
+            )
+        if "position_ids" in batch.batch.keys() and batch.batch["position_ids"].dim() != 2:
+            raise ValueError(
+                "generate_sequences_from_tokens only supports 2D token-only position_ids, "
+                f"got shape {tuple(batch.batch['position_ids'].shape)}"
+            )
+
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+            max_tokens=int(batch.meta_info.get("response_length", config.response_length)),
+        )
+
+        prompt_ids = batch.batch["input_ids"].cpu()
+        prompt_attention_mask = batch.batch["attention_mask"].cpu()
+
+        # 每个样本独立提交给 rollout server；输入已经是 token ids，因此不经过 agent loop 的消息构造流程。
+        tasks = [
+            asyncio.create_task(
+                self._run_token_prompt_generation(
+                    prompt_ids=prompt_ids[i],
+                    prompt_attention_mask=prompt_attention_mask[i],
+                    sampling_params=sampling_params,
+                )
+            )
+            for i in range(len(batch))
+        ]
+        outputs = await asyncio.gather(*tasks)
+        return self._postprocess(outputs)
+
+    async def _run_token_prompt_generation(
+        self,
+        *,
+        prompt_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        sampling_params: dict[str, Any],
+    ) -> _InternalAgentLoopOutput:
+        prompt_ids = prompt_ids.to(dtype=torch.long)
+        prompt_attention_mask = prompt_attention_mask.to(dtype=torch.long)
+        # rollout server 只需要真实 prompt token，先根据 attention_mask 去掉 padding。
+        unpadded_prompt_ids = prompt_ids[prompt_attention_mask.bool()].tolist()
+        response_length = self.config.actor_rollout_ref.rollout.response_length
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        metrics = {}
+        with simple_timer("generate_sequences", metrics):
+            output = await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=unpadded_prompt_ids,
+                sampling_params=dict(sampling_params),
+            )
+
+        # server 返回变长 response；这里裁剪到 response_length，并 pad 回训练侧固定张量形状。
+        response_ids = output.token_ids[:response_length]
+        response_len = len(response_ids)
+        response_tensor = torch.full((1, response_length), pad_token_id, dtype=torch.long)
+        response_attention_mask = torch.zeros((1, response_length), dtype=prompt_attention_mask.dtype)
+        response_mask = torch.zeros((1, response_length), dtype=prompt_attention_mask.dtype)
+        if response_len > 0:
+            response_tensor[0, :response_len] = torch.tensor(response_ids, dtype=torch.long)
+            response_attention_mask[0, :response_len] = 1
+            response_mask[0, :response_len] = 1
+
+        response_logprobs = None
+        if output.log_probs is not None:
+            # logprobs 与 response token 对齐；padding 部分填 0，后续由 response_mask 屏蔽。
+            logprobs = output.log_probs[:response_length]
+            pad_size = response_length - len(logprobs)
+            response_logprobs = torch.tensor(logprobs + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
+        # 重新拼成 rollout 后 DataProto 期望的 prompt+response 序列格式。
+        prompt_tensor = prompt_ids.unsqueeze(0)
+        prompt_attention_mask = prompt_attention_mask.unsqueeze(0)
+        input_ids = torch.cat([prompt_tensor, response_tensor], dim=1)
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        return _InternalAgentLoopOutput(
+            prompt_ids=prompt_tensor,
+            response_ids=response_tensor,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            response_mask=response_mask,
+            attention_mask=attention_mask,
+            response_logprobs=response_logprobs,
+            routed_experts=None,
+            multi_modal_inputs={},
+            multi_modal_data={},
+            reward_score=None,
+            num_turns=1,
+            metrics=AgentLoopMetrics(**metrics),
+            extra_fields={},
+        )
+
     async def _run_agent_loop(
         self,
         sampling_params: dict[str, Any],
@@ -906,6 +1023,12 @@ class AgentLoopManager:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
 
+    def is_hybrid_rollout(self) -> bool:
+        """当前 rollout replica 是否都处于 HYBRID 模式。"""
+        return bool(self.rollout_replicas) and all(
+            replica.rollout_mode == RolloutMode.HYBRID for replica in self.rollout_replicas
+        )
+
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
@@ -954,6 +1077,34 @@ class AgentLoopManager:
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        timing = self._performance_metrics(metrics, output)
+
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        return output
+
+    def generate_sequences_from_tokens(self, prompts: DataProto) -> DataProto:
+        """从 tokenized prompt 生成，不重新 tokenize 原始 messages。
+
+        用于 RUC-SDPO 的 J_f calibration；conditioning context 必须严格等于
+        trainer 构造出的 teacher prompt tensor。
+        """
+
+        self.wake_up()
+        try:
+            # 按 agent loop worker 数切分 batch，每个 worker 内部再逐样本并发请求 rollout server。
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.generate_sequences_from_tokens.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                ]
+            )
+            output = DataProto.concat(outputs)
+        finally:
+            # calibration rollout 后立刻 sleep，释放 rollout engine 资源并保持常规生成路径的生命周期一致。
+            self.sleep()
+
+        metrics = [output.meta_info.pop("metrics") for output in outputs]
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}

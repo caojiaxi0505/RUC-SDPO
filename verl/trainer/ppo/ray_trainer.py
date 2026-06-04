@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import os
 import re
@@ -643,6 +644,20 @@ class RayPPOTrainer:
         return success_by_uid
 
     @staticmethod
+    def _collect_response_indices_by_uid(batch: DataProto) -> dict[Any, list[int]]:
+        response_indices_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            response_indices_by_uid[uid].append(idx)
+        return response_indices_by_uid
+
+    @staticmethod
+    def _to_1d_object_array(values: list[Any]) -> np.ndarray:
+        """构造稳定的一维 object array，避免 list[list[dict]] 被 numpy 自动压成二维。"""
+        output = np.empty(len(values), dtype=object)
+        output[:] = values
+        return output
+
+    @staticmethod
     def _remove_thinking_trace(text: str) -> str:
         """Remove <think>...</think> tags and their content from text."""
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
@@ -651,23 +666,29 @@ class RayPPOTrainer:
         self,
         idx: int,
         success_by_uid: dict[Any, list[int]],
+        response_indices_by_uid: dict[Any, list[int]],
         uids: list[Any],
         response_texts: list[str],
         dont_reprompt_on_self_success: bool = False,
-        remove_thinking_from_demonstration: bool = False,
-    ) -> Optional[str]:
+        remove_thinking_from_demonstration: bool = False,   # 在verl/trainer/config/actor/actor.yaml中默认启用
+        random_select_solution: bool = False,
+        sample_from_all_non_self_solutions: bool = False,
+    ) -> Optional[tuple[str, bool]]:
         uid = uids[idx]
-        solution_idxs = success_by_uid[uid]
-        if dont_reprompt_on_self_success:
-            solution_idxs = [j for j in solution_idxs if j != idx]
+        if sample_from_all_non_self_solutions:
+            solution_idxs = [j for j in response_indices_by_uid[uid] if j != idx]
+        else:
+            solution_idxs = success_by_uid[uid]
+            if dont_reprompt_on_self_success:
+                solution_idxs = [j for j in solution_idxs if j != idx]
         if len(solution_idxs) == 0:
             return None
-        solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
+        solution_idx = int(np.random.choice(solution_idxs)) if random_select_solution else solution_idxs[0]
+        is_correct_solution = solution_idx in set(success_by_uid[uid])
         solution_str = response_texts[solution_idx]
         if remove_thinking_from_demonstration:
             solution_str = self._remove_thinking_trace(solution_str)
-        return solution_str
-
+        return solution_str, is_correct_solution
 
     def _maybe_build_self_distillation_batch(
         self,
@@ -679,6 +700,7 @@ class RayPPOTrainer:
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return None
+        uplift_calibration_enabled = self_distillation_cfg.get("uplift_calibration", {}).get("enable", False)
 
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
@@ -694,18 +716,47 @@ class RayPPOTrainer:
             batch_size=batch_size,
         )
 
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
-        solution_strs = [
+        success_by_uid = self._collect_solutions_by_uid(
+            batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold
+        )
+        response_indices_by_uid = self._collect_response_indices_by_uid(batch)
+        objective = self_distillation_cfg.get("objective", "jsd")
+        ruc_objective = objective in {"ruc-sdpo", "ruc-sdpo-grpo"}
+        random_select_solution_cfg = self_distillation_cfg.get("random_select_solution", None)
+        if random_select_solution_cfg is None:
+            random_select_solution = ruc_objective
+        elif isinstance(random_select_solution_cfg, bool):
+            random_select_solution = random_select_solution_cfg
+        else:
+            raise ValueError(
+                "self_distillation.random_select_solution must be a bool or None, "
+                f"got {random_select_solution_cfg!r}"
+            )
+        sample_from_all_non_self_solutions_cfg = self_distillation_cfg.get(
+            "sample_from_all_non_self_solutions", False
+        )
+        if not isinstance(sample_from_all_non_self_solutions_cfg, bool):
+            raise ValueError(
+                "self_distillation.sample_from_all_non_self_solutions must be a bool, "
+                f"got {sample_from_all_non_self_solutions_cfg!r}"
+            )
+        sample_from_all_non_self_solutions = ruc_objective and sample_from_all_non_self_solutions_cfg
+        selected_solutions = [
             self._get_solution(
                 i,
                 success_by_uid,
+                response_indices_by_uid,
                 batch.non_tensor_batch["uid"],
                 response_texts,
                 self_distillation_cfg.dont_reprompt_on_self_success,
                 self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                random_select_solution,
+                sample_from_all_non_self_solutions,
             )
             for i in range(batch_size)
         ]
+        solution_strs = [selected[0] if selected is not None else None for selected in selected_solutions]
+        solution_is_correct = [selected[1] if selected is not None else None for selected in selected_solutions]
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
@@ -719,9 +770,14 @@ class RayPPOTrainer:
             # build solution section
             solution_section = ""
             if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
-                    successful_previous_attempt=solution_strs[i]
-                )
+                if solution_is_correct[i]:
+                    solution_section = self_distillation_cfg.solution_template.format(
+                        successful_previous_attempt=solution_strs[i]
+                    )
+                else:
+                    solution_section = self_distillation_cfg.incorrect_solution_template.format(
+                        unsuccessful_previous_attempt=solution_strs[i]
+                    )
 
             # build feedback section
             feedback_section = ""
@@ -781,19 +837,335 @@ class RayPPOTrainer:
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for s in solution_strs if s is not None)
+        num_with_correct_solution = sum(1 for is_correct in solution_is_correct if is_correct is True)
+        num_with_incorrect_solution = sum(1 for is_correct in solution_is_correct if is_correct is False)
         metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
+            # 当前 batch 中，至少存在一个成功 rollout 的 prompt/group 占比。
+            "self_distillation/success_group_fraction": len([
+                uid for uid in uids if len(success_by_uid[uid]) > 0
+            ]) / len(uids),
+            # 当前 batch 中，最终选到正确 sibling demonstration 的样本占比。
+            "self_distillation/success_sample_fraction": num_with_correct_solution / batch_size,
+            # 当前 batch 中，最终选到任意 sibling demonstration 的样本占比；正确和错误 demonstration 都计入。
+            "self_distillation/solution_sample_fraction": num_with_solution / batch_size,
+            # 当前 batch 中，最终选到错误 sibling demonstration 的样本占比。
+            "self_distillation/incorrect_solution_sample_fraction": num_with_incorrect_solution / batch_size,
+            # 当前 step 是否启用随机选择 sibling demonstration；1 表示启用，0 表示关闭。
+            "self_distillation/random_select_solution": float(random_select_solution),
+            # 当前 step 是否从所有非自己的 sibling response 中选 demonstration；1 表示启用，0 表示关闭。
+            "self_distillation/sample_from_all_non_self_solutions": float(sample_from_all_non_self_solutions),
+            # 当前 batch 中，reward function 返回了非空环境反馈的样本占比；只表示可用，不代表实际拼入 reprompt。
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+            # 当前 batch 中，最终实际拼入 reprompt 的环境反馈样本占比。
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+            # 当前 batch 中，最终进入 self-distillation KL mask 的样本占比；有 demonstration 或实际使用 feedback 都计入。
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
-        return DataProto.from_dict(tensors={
+        tensors = {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
-        }), metrics
+        }
+        if uplift_calibration_enabled:
+            # 这里为后续 reward-uplift calibration 保留 teacher-conditioned prompt。
+            # teacher_context_key 用于 aggregation="solution" 时区分不同的 prompt+teacher context，
+            # 从而复用相同 context 的 J_f 估计，避免重复 rollout。
+            teacher_prompt_attention_mask = teacher_prompt["attention_mask"].to(device)
+            teacher_context_keys: list[str] = []
+            teacher_prompt_attention_mask_cpu = teacher_prompt["attention_mask"].bool().cpu()
+            teacher_prompt_input_ids_cpu = teacher_prompt["input_ids"].cpu()
+            for i in range(batch_size):
+                if solution_strs[i] is None and not feedback_used[i]:
+                    teacher_context_keys.append("")
+                    continue
+                unpadded_prompt_ids = teacher_prompt_input_ids_cpu[i][teacher_prompt_attention_mask_cpu[i]]
+                prompt_digest = hashlib.sha1(
+                    unpadded_prompt_ids.to(dtype=torch.long).numpy().astype(np.int64).tobytes()
+                ).hexdigest()
+                teacher_context_keys.append(f"{batch.non_tensor_batch['uid'][i]}:{prompt_digest}")
+            tensors.update({
+                "teacher_prompt_input_ids": teacher_prompt["input_ids"].to(device),
+                "teacher_prompt_attention_mask": teacher_prompt_attention_mask,
+                "teacher_prompt_position_ids": compute_position_id_with_mask(teacher_prompt_attention_mask),
+            })
+            return DataProto.from_dict(
+                tensors=tensors,
+                non_tensors={
+                    "teacher_raw_prompt": self._to_1d_object_array(messages),
+                    "teacher_context_key": self._to_1d_object_array(teacher_context_keys),
+                },
+            ), metrics
+        return DataProto.from_dict(tensors=tensors), metrics
+
+    def _compute_self_distillation_uplift_weights(
+        self,
+        batch: DataProto,
+        self_distillation_batch: DataProto,
+        reward_tensor: torch.Tensor,
+        timing_raw: dict[str, float],
+    ) -> tuple[DataProto, dict[str, float]]:
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.self_distillation
+        uplift_cfg = self_distillation_cfg.get("uplift_calibration", {})
+        num_samples = int(uplift_cfg.get("num_samples", 1))
+        reward_upper_bound = float(uplift_cfg.get("reward_upper_bound", 1.0))
+        eps = float(uplift_cfg.get("eps", 1e-6))
+        aggregation = str(uplift_cfg.get("aggregation", "uid"))
+        jf_policy = str(uplift_cfg.get("jf_policy", "actor"))
+        solution_aggregation_enabled = aggregation == "solution"
+        if num_samples <= 0:
+            raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
+        if reward_upper_bound <= 0:
+            raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
+        if eps <= 0:
+            raise ValueError("self_distillation.uplift_calibration.eps must be positive")
+        if aggregation not in {"uid", "solution"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.aggregation must be one of "
+                f"{{'uid', 'solution'}}, got {aggregation!r}"
+            )
+        if jf_policy not in {"actor", "ema_policy"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.jf_policy must be one of "
+                f"{{'actor', 'ema_policy'}}, got {jf_policy!r}"
+            )
+        if (
+            jf_policy == "ema_policy"
+            and self_distillation_cfg.get("teacher_regularization", "ema") != "ema"
+        ):
+            raise ValueError(
+                f"jf_policy={jf_policy!r} requires self_distillation.teacher_regularization='ema'."
+            )
+        if jf_policy == "ema_policy":
+            if not self.async_rollout_mode:
+                raise ValueError("jf_policy='ema_policy' requires async rollout mode.")
+            is_hybrid_rollout = getattr(self.async_rollout_manager, "is_hybrid_rollout", None)
+            if is_hybrid_rollout is None or not is_hybrid_rollout():
+                raise ValueError(
+                    "jf_policy='ema_policy' requires HYBRID async rollout mode so EMA teacher "
+                    "weights can be synchronized into the rollout engine."
+                )
+
+        prompt_keys = {
+            "teacher_prompt_input_ids",
+            "teacher_prompt_attention_mask",
+            "teacher_prompt_position_ids",
+        }
+        missing_prompt_keys = prompt_keys - set(self_distillation_batch.batch.keys())
+        if missing_prompt_keys:
+            raise ValueError(f"Missing uplift calibration prompt keys: {missing_prompt_keys}")
+        if "teacher_raw_prompt" not in self_distillation_batch.non_tensor_batch:
+            raise ValueError("Missing uplift calibration non-tensor key: teacher_raw_prompt")
+        if solution_aggregation_enabled and "teacher_context_key" not in self_distillation_batch.non_tensor_batch:
+            raise ValueError("Missing uplift calibration non-tensor key: teacher_context_key")
+
+        calibration_meta_info = {
+            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "global_steps": self.global_steps,
+        }
+
+        calibration_prompts_all = DataProto.from_dict(
+            tensors={
+                "input_ids": self_distillation_batch.batch["teacher_prompt_input_ids"],
+                "attention_mask": self_distillation_batch.batch["teacher_prompt_attention_mask"],
+                "position_ids": self_distillation_batch.batch["teacher_prompt_position_ids"],
+            },
+            non_tensors={
+                **{k: v.copy() for k, v in batch.non_tensor_batch.items()},
+                "raw_prompt": self_distillation_batch.non_tensor_batch["teacher_raw_prompt"].copy(),
+            },
+            meta_info=calibration_meta_info,
+        )
+        # self_distillation_mask 标记哪些样本实际构造了 teacher-conditioned prompt；
+        # 未命中的样本不需要额外 rollout 估计 J_f。
+        target_mask = self_distillation_batch.batch["self_distillation_mask"]
+        target_mask_cpu = target_mask.detach().cpu().bool().tolist()
+        teacher_context_keys = None
+        unique_context_keys: list[str] = []
+        unique_context_indices: list[int] = []
+        calibration_source_indices: list[int] = []
+        if solution_aggregation_enabled:
+            # aggregation="solution" 时，同一 prompt+teacher context 可能在一个 group 内重复出现。
+            # 这里按 teacher_context_key 去重，只对唯一 context 做 calibration rollout，后续再映射回每个样本。
+            teacher_context_keys = [
+                "" if key is None else str(key)
+                for key in self_distillation_batch.non_tensor_batch["teacher_context_key"]
+            ]
+            seen_context_keys: set[str] = set()
+            for idx, key in enumerate(teacher_context_keys):
+                if not target_mask_cpu[idx] or not key:
+                    continue
+                if key in seen_context_keys:
+                    continue
+                seen_context_keys.add(key)
+                unique_context_keys.append(key)
+                unique_context_indices.append(idx)
+            calibration_source_indices = unique_context_indices
+            calibration_prompts = calibration_prompts_all.select_idxs(
+                np.array(calibration_source_indices, dtype=np.int64)
+            )
+        else:
+            # aggregation="uid" 只对实际有 teacher-conditioned target 的样本做 rollout；
+            # 后续仍按 uid 聚合 J_f，未命中的 uid 回退到 J_0。
+            calibration_source_indices = [idx for idx, is_target in enumerate(target_mask_cpu) if is_target]
+            calibration_prompts = calibration_prompts_all.select_idxs(
+                np.array(calibration_source_indices, dtype=np.int64)
+            )
+        effective_num_samples = num_samples
+        calibration_base_size = len(calibration_prompts)
+        # 每个 teacher-conditioned prompt 额外采样 num_samples 次，用样本均值估计 J_f。
+        calibration_prompts = calibration_prompts.repeat(repeat_times=effective_num_samples, interleave=True)
+
+        # rollout worker 需要 batch size 能被 worker 数整除，先 padding，生成后再 unpad。
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+        if calibration_base_size > 0:
+            calibration_prompts_padded, pad_size = pad_dataproto_to_divisor(calibration_prompts, size_divisor)
+            with marked_timer("self_distillation_uplift_gen", timing_raw, color="red"):
+                # 根据 jf_policy 选择用于估计 J_f 的策略：EMA policy 或当前 actor。
+                if jf_policy == "ema_policy":
+                    if not self.async_rollout_mode:
+                        raise ValueError("jf_policy='ema_policy' requires async rollout mode.")
+                    self.actor_rollout_wg.set_rollout_weight_source("ema_teacher")
+                    try:
+                        calibration_output_padded = self.async_rollout_manager.generate_sequences_from_tokens(
+                            calibration_prompts_padded
+                        )
+                    finally:
+                        self.actor_rollout_wg.set_rollout_weight_source("actor")
+                elif not self.async_rollout_mode:
+                    calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
+                else:
+                    calibration_output_padded = self.async_rollout_manager.generate_sequences(calibration_prompts_padded)
+                uplift_timing = calibration_output_padded.meta_info.pop("timing", {})
+                timing_raw.update({f"self_distillation_uplift/{k}": v for k, v in uplift_timing.items()})
+            calibration_output = unpad_dataproto(calibration_output_padded, pad_size=pad_size)
+
+            # 对 calibration rollout 的 response 重新计算 reward，得到估计 J_f 所需的样本 reward。
+            reward_batch = DataProto(
+                batch=calibration_output.batch,
+                non_tensor_batch=calibration_prompts.non_tensor_batch,
+                meta_info=calibration_output.meta_info,
+            )
+            if self.use_rm and "rm_scores" not in reward_batch.batch.keys():
+                if not self.use_reward_loop:
+                    rm_scores = self.rm_wg.compute_rm_score(reward_batch)
+                else:
+                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                    rm_scores = self.reward_loop_manager.compute_rm_score(reward_batch)
+                reward_batch = reward_batch.union(rm_scores)
+
+            with marked_timer("self_distillation_uplift_reward", timing_raw, color="yellow"):
+                if self.config.reward_model.launch_reward_fn_async:
+                    future_reward = compute_reward_async.remote(
+                        data=reward_batch, config=self.config, tokenizer=self.tokenizer, reward_fn=self.reward_fn
+                    )
+                    calibration_reward_tensor, _ = ray.get(future_reward)
+                else:
+                    calibration_reward_tensor, _ = self._compute_or_extract_reward(
+                        reward_batch, reward_fn=self.reward_fn, return_dict=False
+                    )
+
+            # reshape 后每一行对应一个 teacher-conditioned prompt/context，
+            # 每一列对应一次额外采样，后续按行求均值作为 J_f。
+            calibration_scores = calibration_reward_tensor.sum(dim=-1).detach().to(
+                device=reward_tensor.device, dtype=torch.float32
+            )
+            calibration_scores = calibration_scores.reshape(calibration_base_size, effective_num_samples)
+        else:
+            calibration_scores = None
+
+        # J_0 来自原始 rollout 的 reward；同一 uid/prompt group 内先求均值，再映射回每个样本。
+        baseline_scores = reward_tensor.sum(dim=-1).detach().to(dtype=torch.float32)
+
+        uids = batch.non_tensor_batch["uid"]
+        uid_to_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid_to_scores[uid].append(baseline_scores[idx])
+        uid_to_j0 = {uid: torch.stack(scores).mean() for uid, scores in uid_to_scores.items()}
+        j0 = torch.stack([uid_to_j0[uid] for uid in uids])
+
+        if solution_aggregation_enabled:
+            # aggregation="solution" 时，每个 prompt+teacher context 单独估计 J_f。
+            # 没有有效 teacher context 的样本回退到 J_0，使对应 uplift 权重为 0。
+            context_to_jf: dict[str, torch.Tensor] = {}
+            if calibration_scores is not None:
+                for context_idx, key in enumerate(unique_context_keys):
+                    context_to_jf[key] = calibration_scores[context_idx].mean()
+            assert teacher_context_keys is not None
+            jf = torch.stack([
+                context_to_jf.get(teacher_context_keys[idx], uid_to_j0[uid])
+                if target_mask_cpu[idx]
+                else uid_to_j0[uid]
+                for idx, uid in enumerate(uids)
+            ])
+        else:
+            # aggregation="uid" 时，在 prompt/group 级别估计 teacher-conditioned value：
+            #   J_f(x) = 同一 uid 下所有 self-distillation 有效样本的 teacher-conditioned rollout reward 均值。
+            # 这样可以避免 num_samples=1 且 reward 为二值时，单条 trajectory 形成过于噪声的硬门控。
+            uid_to_calibration_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+            if calibration_scores is not None:
+                for calibration_idx, batch_idx in enumerate(calibration_source_indices):
+                    uid_to_calibration_scores[uids[batch_idx]].append(calibration_scores[calibration_idx])
+
+            uid_to_jf = {}
+            for uid in uid_to_scores:
+                if len(uid_to_calibration_scores[uid]) > 0:
+                    uid_to_jf[uid] = torch.stack(uid_to_calibration_scores[uid]).mean()
+                else:
+                    # 该 prompt/group 没有 teacher-conditioned target，令 J_f = J_0，
+                    # 使最终 uplift 权重恰好为 0。
+                    uid_to_jf[uid] = uid_to_j0[uid]
+            jf = torch.stack([uid_to_jf[uid] for uid in uids])
+
+        gap = reward_upper_bound - j0
+        # raw_u 衡量 teacher-conditioned rollout 相对原始 rollout 的 reward uplift；
+        # gap 很小时直接置 0，随后裁剪到 [0, 1] 并只保留 self-distillation 有效样本。
+        raw_u = torch.where(gap > eps, (jf - j0) / gap.clamp(min=eps), torch.zeros_like(j0))
+        u = raw_u.clamp(min=0.0, max=1.0)
+        target_mask = target_mask.to(device=u.device, dtype=u.dtype)
+        u = u * target_mask
+
+        active_target_count = float(sum(target_mask_cpu))
+        unique_context_count = float(len(unique_context_keys)) if solution_aggregation_enabled else 0.0
+        context_reuse_mean = (
+            active_target_count / unique_context_count
+            if solution_aggregation_enabled and unique_context_count > 0
+            else 0.0
+        )
+
+        metrics = {
+            # 原始 rollout 的 prompt/group 级平均 reward，即 J_0。
+            "self_distillation/uplift_j0_mean": j0.mean().item(),
+            # teacher-conditioned rollout 的平均 reward，即 J_f。
+            "self_distillation/uplift_jf_mean": jf.mean().item(),
+            # 裁剪前的 reward uplift 权重均值：(J_f - J_0) / (reward_upper_bound - J_0)。
+            "self_distillation/uplift_raw_mean": raw_u.mean().item(),
+            # 裁剪到 [0, 1] 且应用 self_distillation_mask 后的最终 uplift 权重均值。
+            "self_distillation/uplift_weight_mean": u.mean().item(),
+            # 当前 batch 中最终 uplift 权重大于 0 的样本占比。
+            "self_distillation/uplift_weight_positive_fraction": (u > 0).float().mean().item(),
+            # 每个 teacher-conditioned prompt/context 额外采样的 rollout 数。
+            "self_distillation/uplift_num_samples": effective_num_samples,
+            # aggregation="solution" 时参与 calibration rollout 的唯一 prompt+teacher context 数量。
+            "self_distillation/uplift_unique_context_count": unique_context_count,
+            # aggregation="solution" 时，每个唯一 context 平均被多少个有效样本复用。
+            "self_distillation/uplift_context_reuse_mean": context_reuse_mean,
+            # 当前 step 是否使用 aggregation="uid"；1 表示启用，0 表示关闭。
+            "self_distillation/uplift_aggregation_uid": float(
+                (not solution_aggregation_enabled) and aggregation == "uid"
+            ),
+            # 当前 step 是否使用 aggregation="solution"；1 表示启用，0 表示关闭。
+            "self_distillation/uplift_aggregation_solution": float(solution_aggregation_enabled),
+            # 当前 step 是否使用 actor 估计 J_f；1 表示启用，0 表示关闭。
+            "self_distillation/uplift_jf_policy_actor": float(jf_policy == "actor"),
+            # 当前 step 是否使用 EMA policy 估计 J_f；1 表示启用，0 表示关闭。
+            "self_distillation/uplift_jf_policy_ema_policy": float(jf_policy == "ema_policy"),
+        }
+        return DataProto.from_dict(tensors={"self_distillation_u": u}), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
@@ -1787,6 +2159,29 @@ class RayPPOTrainer:
                         self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
                         if self_distillation_data is not None:
                             self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            # self_distillation_batch 已包含 KL 蒸馏所需的 teacher response 序列。
+                            # 如果启用 reward-uplift calibration，则额外用 teacher-conditioned prompt rollout，
+                            # 估计 uplift 权重 self_distillation_u 并并入 batch，供 actor loss 缩放蒸馏损失。
+                            uplift_cfg = self.config.actor_rollout_ref.actor.self_distillation.get("uplift_calibration", {})
+                            if uplift_cfg.get("enable", False):
+                                uplift_batch, uplift_metrics = self._compute_self_distillation_uplift_weights(
+                                    batch=batch,
+                                    self_distillation_batch=self_distillation_batch,
+                                    reward_tensor=reward_tensor,
+                                    timing_raw=timing_raw,
+                                )
+                                self_distillation_batch = self_distillation_batch.union(uplift_batch)
+                                # calibration 用的 prompt 字段只服务于估计 self_distillation_u，
+                                # actor update 不需要这些临时字段，合并主 batch 前清理掉。
+                                self_distillation_batch.pop(
+                                    batch_keys=[
+                                        "teacher_prompt_input_ids",
+                                        "teacher_prompt_attention_mask",
+                                        "teacher_prompt_position_ids",
+                                    ],
+                                    non_tensor_batch_keys=["teacher_raw_prompt", "teacher_context_key"],
+                                )
+                                self_distillation_metrics.update(uplift_metrics)
                             batch = batch.union(self_distillation_batch)
                             metrics.update(self_distillation_metrics)
 

@@ -1093,6 +1093,7 @@ def compute_self_distillation_loss(
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_weights: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1179,12 +1180,33 @@ def compute_self_distillation_loss(
     if rollout_is_weights is not None:
         per_token_loss = per_token_loss * rollout_is_weights
 
+    unweighted_loss = agg_loss(
+        loss_mat=per_token_loss,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+    )
+    metrics["self_distillation/unweighted_loss"] = unweighted_loss.detach().item()
+
+    if self_distillation_weights is not None:
+        if self_distillation_weights.dim() != 1 or self_distillation_weights.shape[0] != per_token_loss.shape[0]:
+            raise ValueError(
+                "self_distillation_weights must have shape (batch_size,), got "
+                f"{tuple(self_distillation_weights.shape)} for batch size {per_token_loss.shape[0]}"
+            )
+        weights = self_distillation_weights.to(dtype=per_token_loss.dtype, device=per_token_loss.device)
+        per_token_loss = per_token_loss * weights.unsqueeze(-1)
+        metrics["self_distillation/weight_mean"] = weights.mean().detach().item()
+        metrics["self_distillation/weight_min"] = weights.min().detach().item()
+        metrics["self_distillation/weight_max"] = weights.max().detach().item()
+
     loss = agg_loss(
         loss_mat=per_token_loss,
         loss_mask=loss_mask,
         loss_agg_mode=loss_agg_mode,
         batch_num_tokens=loss_mask.sum().clamp(min=1.0),
     )
+    metrics["self_distillation/weighted_loss"] = loss.detach().item()
     return loss, metrics
 
 

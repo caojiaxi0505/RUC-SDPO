@@ -669,6 +669,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.layered_summon = self.config.rollout.get("layered_summon", False)
+        # rollout engine 默认同步 actor 权重；reward-uplift calibration 可临时切到 EMA teacher 权重。
+        self.rollout_weight_source = "actor"
 
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
@@ -679,27 +681,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
 
-        log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
+        # wake_up rollout engine 时，根据当前设置选择要同步进 rollout engine 的 FSDP module。
+        rollout_weight_source = getattr(self, "rollout_weight_source", "actor")
+        if rollout_weight_source == "actor":
+            # 常规训练/采样路径：同步当前 actor 权重。
+            rollout_module_fsdp = self.actor_module_fsdp
+            if self._is_offload_param:
+                log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
+        elif rollout_weight_source == "ema_teacher":
+            # RUC-SDPO 的 J_f 估计路径：临时同步 EMA teacher 权重到 rollout engine。
+            if not hasattr(self, "actor") or self.actor.teacher_module is None:
+                raise ValueError("EMA teacher rollout requires actor.teacher_module to be initialized.")
+            if self.config.ref.fsdp_config.get("param_offload", False):
+                raise ValueError("EMA teacher vLLM rollout does not support ref.fsdp_config.param_offload=True yet.")
+            rollout_module_fsdp = self.actor.teacher_module
+            log_gpu_memory_usage("Using EMA teacher weights for rollout sync", logger=logger)
+        else:
+            raise ValueError(f"Unknown rollout_weight_source: {rollout_weight_source!r}")
 
         peft_config = None
-        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        peft_model = getattr(rollout_module_fsdp, "_fsdp_wrapped_module", rollout_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
+            # 目前 EMA teacher 的 vLLM 权重同步只支持全量权重，不支持 LoRA teacher。
+            if rollout_weight_source != "actor":
+                raise ValueError("EMA teacher vLLM rollout does not support LoRA teacher weights yet.")
             peft_config = peft_model.peft_config.get("default", None)
             params = collect_lora_params(
-                module=self.actor_module_fsdp,
+                module=rollout_module_fsdp,
                 layered_summon=self.config.rollout.get("layered_summon", False),
                 base_sync_done=self.base_sync_done,
             )
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
-            params = self.actor_module_fsdp.state_dict()
+            params = rollout_module_fsdp.state_dict()
 
         params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            params, getattr(rollout_module_fsdp, "_fsdp_wrapped_module", rollout_module_fsdp)
         )
 
         # Special handling for LoRA with sleep_level=2:
@@ -708,17 +728,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Here: params contains LoRA weights, base_model_params contains base model weights.
         if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
             base_model_params = collect_lora_params(
-                module=self.actor_module_fsdp,
+                module=rollout_module_fsdp,
                 layered_summon=self.layered_summon,
                 base_sync_done=False,
             )
             base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
             base_model_params = convert_weight_keys(
-                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                base_model_params, getattr(rollout_module_fsdp, "_fsdp_wrapped_module", rollout_module_fsdp)
             )
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
-        if self._is_offload_param:
+        # 只有 actor 常规路径会按 actor offload 配置回收参数；EMA teacher 路径不在这里做 ref/teacher offload。
+        if rollout_weight_source == "actor" and self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
@@ -881,6 +902,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_tiled_mlp=ref_use_tiled_mlp,
                 tiled_mlp_shards=ref_tiled_mlp_shards,
             )[0]
+            # ref_module 后续可能作为 self-distillation 的 teacher_module 使用；
+            # 这里显式设置 FSDP state_dict 类型，保证后续 state_dict/rollout 权重同步路径一致。
+            if torch.distributed.get_world_size() == 1 and fsdp_version(self.ref_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.ref_module_fsdp,
+                    state_dict_type=StateDictType.FULL_STATE_DICT,
+                    state_dict_config=FullStateDictConfig(),
+                )
+            elif fsdp_version(self.ref_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.ref_module_fsdp,
+                    state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                    state_dict_config=ShardedStateDictConfig(),
+                )
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
@@ -896,12 +931,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if self_distillation_cfg is not None and loss_mode == "sdpo":
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     if teacher_regularization == "trust-region":
+                        # trust-region teacher 每次前向时混合 ref 和当前 actor，不能直接复用 ref_module。
                         self.actor.teacher_module = TrustRegionTeacher(
                             ref_module=self.ref_module_fsdp,
                             student_module=self.actor_module_fsdp,
                             mix_coef=self_distillation_cfg.get("teacher_update_rate", 0.0),
                         )
                     else:
+                        # 默认 EMA teacher 复用 ref_module 容器，后续由 actor._update_teacher() 按 EMA 规则更新权重。
                         self.actor.teacher_module = self.ref_module_fsdp
 
         if self._is_actor:
@@ -972,6 +1009,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_rollout_weight_source(self, source: str):
+        """选择下一次 rollout_mode() 将哪个 FSDP module 同步到 rollout engine。"""
+        if source not in {"actor", "ema_teacher"}:
+            raise ValueError(f"rollout weight source must be one of {{'actor', 'ema_teacher'}}, got {source!r}")
+        if source == "ema_teacher":
+            # 只有 EMA teacher 才能通过权重同步进入 rollout engine；trust-region teacher 不是独立静态权重。
+            if not hasattr(self, "actor") or self.actor.teacher_module is None:
+                raise ValueError("EMA teacher rollout requires actor.teacher_module to be initialized.")
+            teacher_regularization = self.config.actor.self_distillation.get("teacher_regularization", "ema")
+            if teacher_regularization != "ema":
+                raise ValueError("EMA teacher rollout requires self_distillation.teacher_regularization='ema'.")
+        self.rollout_weight_source = source
+        return True
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")

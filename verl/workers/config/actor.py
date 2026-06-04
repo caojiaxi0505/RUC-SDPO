@@ -41,6 +41,9 @@ class SelfDistillationConfig(BaseConfig):
 
     Args:
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
+        objective (str): 自蒸馏目标类型。"jsd" 表示原始 SDPO；"ruc-sdpo" 表示 reward-uplift calibration SDPO；"ruc-sdpo-grpo" 表示 RUC-SDPO 结合 GRPO。
+        auxiliary_coef (float): 辅助损失系数，用于控制辅助目标在总损失中的权重。
+        auxiliary_base_loss_mode (str): 辅助目标叠加时使用的基础策略损失类型。
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
@@ -51,17 +54,24 @@ class SelfDistillationConfig(BaseConfig):
         max_reprompt_len (int): Maximum length of the reprompted prompt.
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
-        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
+        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from selected demonstrations before reprompting.
+        random_select_solution (Optional[bool]): 是否随机选择 sibling demonstration。None 表示 ruc-sdpo/ruc-sdpo-grpo 默认随机，jsd 默认取第一个。
+        sample_from_all_non_self_solutions (bool): 是否在 ruc-sdpo/ruc-sdpo-grpo 中从所有非自己的 sibling response 中选择 demonstration；选中错误 response 时使用 incorrect_solution_template。
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
         solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
+        incorrect_solution_template (str): Template for formatting incorrect solution section. Uses {unsuccessful_previous_attempt} placeholder.
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
+        uplift_calibration (dict[str, Any]): 可选的 reward-uplift 校准配置，用于缩放蒸馏损失。设置 aggregation="solution" 时，会按 prompt+teacher context 估计 J_f。
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
     """
 
+    objective: str = "jsd"
+    auxiliary_coef: float = 0.2
+    auxiliary_base_loss_mode: str = "vanilla"
     full_logit_distillation: bool = True
     alpha: float = 0.0
     success_reward_threshold: float = 1.0
@@ -73,6 +83,8 @@ class SelfDistillationConfig(BaseConfig):
     reprompt_truncation: str = "right"
     dont_reprompt_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
+    random_select_solution: Optional[bool] = None
+    sample_from_all_non_self_solutions: bool = False
     is_clip: Optional[float] = None
     reprompt_template: str = (
         "{prompt}{solution}{feedback}\n\n"
@@ -83,6 +95,11 @@ class SelfDistillationConfig(BaseConfig):
         "Correct solution:\n\n"
         "{successful_previous_attempt}\n\n"
     )
+    incorrect_solution_template: str = (
+        "\n"
+        "Incorrect solution:\n\n"
+        "{unsuccessful_previous_attempt}\n\n"
+    )
     feedback_template: str = (
         "\n"
         "The following is feedback from your unsuccessful earlier attempt:\n\n"
@@ -90,8 +107,43 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    """
+    jf_policy 可选值：
+        - "actor": 使用当前 actor rollout 估计 J_f。
+        - "ema_policy": 使用 EMA policy rollout 估计 J_f，对应旧版 ema_teacher_vllm。
+          后续不再支持 ema_teacher_fsdp。
+    num_samples:
+        每个 teacher-conditioned prompt 额外采样多少次，用于估计 J_f；数值越大估计越稳定但开销越高。
+    aggregation:
+        J_f 的聚合方式。
+        - "uid" 表示同一 prompt/group 共享一个 uplift 权重；
+        - "solution" 表示按 prompt+teacher context 估计。
+    """
+    uplift_calibration: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "jf_policy": "actor",
+            "num_samples": 1,
+            "aggregation": "uid",
+            "reward_upper_bound": 1.0,
+            "eps": 1e-6,
+        }
+    )
 
     def __post_init__(self):
+        valid_objectives = {"jsd", "ruc-sdpo", "ruc-sdpo-grpo"}
+        if self.objective not in valid_objectives:
+            raise ValueError(
+                "self_distillation.objective must be one of {'jsd', 'ruc-sdpo', 'ruc-sdpo-grpo'}, "
+                f"got {self.objective}"
+            )
+        if self.objective in {"ruc-sdpo", "ruc-sdpo-grpo"} and not self.uplift_calibration.get("enable", False):
+            raise ValueError(
+                "self_distillation.objective is set to ruc-sdpo/ruc-sdpo-grpo, "
+                "but self_distillation.uplift_calibration.enable is False"
+            )
+        if self.auxiliary_coef < 0:
+            raise ValueError(f"self_distillation.auxiliary_coef must be non-negative, got {self.auxiliary_coef}")
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
         valid_teacher_regularization = ["ema", "trust-region"]
@@ -110,6 +162,31 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.random_select_solution is not None and not isinstance(self.random_select_solution, bool):
+            raise ValueError(
+                "self_distillation.random_select_solution must be a bool or None, "
+                f"got {self.random_select_solution}"
+            )
+        if not isinstance(self.sample_from_all_non_self_solutions, bool):
+            raise ValueError(
+                "self_distillation.sample_from_all_non_self_solutions must be a bool, "
+                f"got {self.sample_from_all_non_self_solutions}"
+            )
+        if self.uplift_calibration.get("num_samples", 1) <= 0:
+            raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
+        if self.uplift_calibration.get("reward_upper_bound", 1.0) <= 0:
+            raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
+        if self.uplift_calibration.get("eps", 1e-6) <= 0:
+            raise ValueError("self_distillation.uplift_calibration.eps must be positive")
+        if self.uplift_calibration.get("aggregation", "uid") not in {"uid", "solution"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.aggregation must be one of {'uid', 'solution'}"
+            )
+        if self.uplift_calibration.get("jf_policy", "actor") not in {"actor", "ema_policy"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.jf_policy must be one of "
+                "{'actor', 'ema_policy'}"
+            )
 
 
 @dataclass
