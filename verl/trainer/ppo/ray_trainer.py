@@ -984,6 +984,20 @@ class RayPPOTrainer:
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
             "global_steps": self.global_steps,
         }
+        token_only_forbidden_keys = {
+            "multi_modal_inputs",
+            "multi_modal_data",
+            "image_data",
+            "video_data",
+        }
+        # J_f calibration 使用 trainer 已经构造好的 teacher prompt tensor。
+        # 这些 prompt 是纯 token 序列，不能继续携带原始 batch 的多模态字段，否则
+        # tokenized rollout 路径会误判为多模态请求并拒绝生成。
+        calibration_non_tensors = {
+            k: v.copy()
+            for k, v in batch.non_tensor_batch.items()
+            if k not in token_only_forbidden_keys
+        }
 
         calibration_prompts_all = DataProto.from_dict(
             tensors={
@@ -992,7 +1006,7 @@ class RayPPOTrainer:
                 "position_ids": self_distillation_batch.batch["teacher_prompt_position_ids"],
             },
             non_tensors={
-                **{k: v.copy() for k, v in batch.non_tensor_batch.items()},
+                **calibration_non_tensors,
                 "raw_prompt": self_distillation_batch.non_tensor_batch["teacher_raw_prompt"].copy(),
             },
             meta_info=calibration_meta_info,
