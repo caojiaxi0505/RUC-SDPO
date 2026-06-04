@@ -14,13 +14,16 @@
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    compute_self_distillation_loss,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -311,6 +314,44 @@ def test_grpo_and_vectorized_equivalence(batch_size: int, seq_len: int, num_grou
     assert ret1.shape == ret2.shape == (batch_size, seq_len)
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_self_distillation_weights_scale_sequence_loss():
+    torch.manual_seed(0)
+    batch_size, seq_len, vocab_size = 2, 3, 5
+    response_mask = torch.ones(batch_size, seq_len)
+    student_all_log_probs = torch.log_softmax(torch.randn(batch_size, seq_len, vocab_size), dim=-1)
+    teacher_all_log_probs = torch.log_softmax(torch.randn(batch_size, seq_len, vocab_size), dim=-1)
+    weights = torch.tensor([0.0, 0.5])
+    config = SimpleNamespace(
+        full_logit_distillation=True,
+        distillation_topk=None,
+        distillation_add_tail=True,
+        alpha=0.0,
+        is_clip=None,
+    )
+
+    loss, metrics = compute_self_distillation_loss(
+        student_log_probs=torch.zeros(batch_size, seq_len),
+        teacher_log_probs=torch.zeros(batch_size, seq_len),
+        response_mask=response_mask,
+        self_distillation_config=config,
+        student_all_log_probs=student_all_log_probs,
+        teacher_all_log_probs=teacher_all_log_probs,
+        self_distillation_weights=weights,
+    )
+
+    per_token_loss = F.kl_div(
+        student_all_log_probs,
+        teacher_all_log_probs,
+        reduction="none",
+        log_target=True,
+    ).sum(-1)
+    expected = (per_token_loss * weights.unsqueeze(-1)).sum() / response_mask.sum()
+    assert torch.allclose(loss, expected)
+    assert metrics["self_distillation/weight_mean"] == pytest.approx(weights.mean().item())
+    assert metrics["self_distillation/weight_min"] == pytest.approx(weights.min().item())
+    assert metrics["self_distillation/weight_max"] == pytest.approx(weights.max().item())
 
 
 if __name__ == "__main__":
