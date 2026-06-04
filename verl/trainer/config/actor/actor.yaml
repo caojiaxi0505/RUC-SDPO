@@ -83,6 +83,18 @@ self_distillation:
 
   # Distillation is enabled when policy_loss.loss_mode == "sdpo"
 
+  # Self-distillation objective.
+  # "jsd" 表示原始 SDPO。
+  # "ruc-sdpo" 表示 reward-uplift calibration SDPO。
+  # "ruc-sdpo-grpo" 表示 RUC-SDPO 结合 GRPO。
+  objective: jsd
+
+  # Auxiliary coefficient for objectives that add a self-distillation auxiliary loss.
+  auxiliary_coef: 0.2
+
+  # Base policy loss used by auxiliary objectives such as ruc-sdpo-grpo.
+  auxiliary_base_loss_mode: vanilla
+
   # Whether to use full-logit KL distillation
   full_logit_distillation: True
 
@@ -113,8 +125,15 @@ self_distillation:
   # Whether to not reprompt on self-success
   dont_reprompt_on_self_success: True
 
-  # Whether to remove <think>...</think> tags from successful demonstrations before reprompting
+  # Whether to remove <think>...</think> tags from selected demonstrations before reprompting
   remove_thinking_from_demonstration: True
+
+  # 是否随机选择 sibling demonstration；null 表示 ruc-sdpo/ruc-sdpo-grpo 默认随机，jsd 默认取第一个。
+  random_select_solution: null
+
+  # 是否在 ruc-sdpo/ruc-sdpo-grpo 中从所有非自己的 sibling response 中选择 demonstration。
+  # 关闭时只从正确 sibling response 中选；开启后选中错误 response 会使用 incorrect_solution_template 包装。
+  sample_from_all_non_self_solutions: False
 
   # Whether to include environment feedback in reprompting for wrong attempts
   # If True and feedback exists: use reprompt_template_feedback_solution (with solution) or reprompt_template_feedback (without solution)
@@ -127,7 +146,25 @@ self_distillation:
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
-  # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
+  # Reward-uplift calibration for scaling the distillation loss.
+  # Disabled by default to preserve the original SDPO behavior.
+  uplift_calibration:
+    enable: False
+    # jf_policy 可选值：
+    # - "actor": 使用当前 actor rollout 估计 J_f。
+    # - "ema_policy": 使用 EMA policy 估计 J_f，对应旧版 ema_teacher_vllm。
+    # 后续不再支持 ema_teacher_fsdp。
+    jf_policy: actor
+    # 每个 teacher-conditioned prompt 额外采样多少次，用于估计 J_f；数值越大估计越稳定但开销越高。
+    num_samples: 1
+    # J_f 的聚合方式：
+    # - "uid": 同一 prompt/group 共享一个 uplift 权重。
+    # - "solution": 按 prompt+teacher context 估计。
+    aggregation: uid
+    reward_upper_bound: 1.0
+    eps: 1e-6
+
+  # Reprompting template - available variables: prompt, solution, feedback
   reprompt_template: |-
     {prompt}{solution}{feedback}
 
@@ -139,6 +176,13 @@ self_distillation:
     Correct solution:
 
     {successful_previous_attempt}
+
+  # Incorrect solution template - available variables: unsuccessful_previous_attempt
+  incorrect_solution_template: |-
+
+    Incorrect solution:
+
+    {unsuccessful_previous_attempt}
 
   # Feedback template - available variables: feedback_raw
   feedback_template: |-
