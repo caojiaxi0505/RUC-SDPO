@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -71,6 +72,8 @@ from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -487,7 +490,12 @@ class RayPPOTrainer:
         print(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+        self,
+        batch: DataProto,
+        reward_extra_infos_dict: dict,
+        timing_raw: dict,
+        rollout_data_dir: str,
+        extra_infos_to_dump: Optional[dict[str, list[Any]]] = None,
     ):
         """Log rollout data to disk.
         Args:
@@ -503,6 +511,18 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if extra_infos_to_dump:
+                # 这些额外字段已经按 student rollout 行对齐，因此会写入同一条 JSONL 记录。
+                for key, values in extra_infos_to_dump.items():
+                    if len(values) == len(outputs):
+                        reward_extra_infos_to_dump[key] = values
+                    else:
+                        logger.warning(
+                            "Skip rollout dump field %s because its length %s does not match student rollout length %s.",
+                            key,
+                            len(values),
+                            len(outputs),
+                        )
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -907,6 +927,7 @@ class RayPPOTrainer:
     ) -> tuple[DataProto, dict[str, float]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.self_distillation
         uplift_cfg = self_distillation_cfg.get("uplift_calibration", {})
+        batch_size = len(batch)
         num_samples = int(uplift_cfg.get("num_samples", 1))
         reward_upper_bound = float(uplift_cfg.get("reward_upper_bound", 1.0))
         eps = float(uplift_cfg.get("eps", 1e-6))
@@ -1013,6 +1034,7 @@ class RayPPOTrainer:
             )
         effective_num_samples = num_samples
         calibration_base_size = len(calibration_prompts)
+        calibration_prompts_base = calibration_prompts
         # 每个 teacher-conditioned prompt 额外采样 num_samples 次，用样本均值估计 J_f。
         calibration_prompts = calibration_prompts.repeat(repeat_times=effective_num_samples, interleave=True)
 
@@ -1075,8 +1097,68 @@ class RayPPOTrainer:
                 device=reward_tensor.device, dtype=torch.float32
             )
             calibration_scores = calibration_scores.reshape(calibration_base_size, effective_num_samples)
+
+            # 整理 teacher rollout 的落盘信息，并按原始 student rollout 的行号对齐。
+            # aggregation="solution" 可能会复用同一个 teacher context；这些行会共享同一组 teacher rollout。
+            teacher_prompt_texts = self.tokenizer.batch_decode(
+                calibration_prompts_base.batch["input_ids"],
+                skip_special_tokens=True,
+            )
+            teacher_response_texts = self.tokenizer.batch_decode(
+                calibration_output.batch["responses"],
+                skip_special_tokens=True,
+            )
+            teacher_response_rows = [
+                teacher_response_texts[
+                    row_idx * effective_num_samples:(row_idx + 1) * effective_num_samples
+                ]
+                for row_idx in range(calibration_base_size)
+            ]
+            teacher_score_rows = calibration_scores.detach().cpu().tolist()
+
+            teacher_rollout_input: list[str | None] = [None] * batch_size
+            teacher_rollout_outputs: list[list[str]] = [[] for _ in range(batch_size)]
+            teacher_rollout_scores: list[list[float]] = [[] for _ in range(batch_size)]
+            teacher_rollout_jf_policy: list[str | None] = [None] * batch_size
+            teacher_rollout_aggregation: list[str | None] = [None] * batch_size
+            teacher_rollout_context_key: list[str | None] = [None] * batch_size
+
+            if solution_aggregation_enabled:
+                assert teacher_context_keys is not None
+                context_to_calibration_idx = {
+                    key: calibration_idx for calibration_idx, key in enumerate(unique_context_keys)
+                }
+                batch_to_calibration_idx = {
+                    idx: context_to_calibration_idx[key]
+                    for idx, key in enumerate(teacher_context_keys)
+                    if target_mask_cpu[idx] and key in context_to_calibration_idx
+                }
+            else:
+                batch_to_calibration_idx = {
+                    batch_idx: calibration_idx
+                    for calibration_idx, batch_idx in enumerate(calibration_source_indices)
+                }
+
+            for batch_idx, calibration_idx in batch_to_calibration_idx.items():
+                teacher_rollout_input[batch_idx] = teacher_prompt_texts[calibration_idx]
+                teacher_rollout_outputs[batch_idx] = teacher_response_rows[calibration_idx]
+                teacher_rollout_scores[batch_idx] = [float(score) for score in teacher_score_rows[calibration_idx]]
+                teacher_rollout_jf_policy[batch_idx] = jf_policy
+                teacher_rollout_aggregation[batch_idx] = aggregation
+                if teacher_context_keys is not None:
+                    teacher_rollout_context_key[batch_idx] = teacher_context_keys[batch_idx]
+
+            teacher_rollout_dump_infos = {
+                "teacher_rollout_input": teacher_rollout_input,
+                "teacher_rollout_outputs": teacher_rollout_outputs,
+                "teacher_rollout_scores": teacher_rollout_scores,
+                "teacher_rollout_jf_policy": teacher_rollout_jf_policy,
+                "teacher_rollout_aggregation": teacher_rollout_aggregation,
+                "teacher_rollout_context_key": teacher_rollout_context_key,
+            }
         else:
             calibration_scores = None
+            teacher_rollout_dump_infos = {}
 
         # J_0 来自原始 rollout 的 reward；同一 uid/prompt group 内先求均值，再映射回每个样本。
         baseline_scores = reward_tensor.sum(dim=-1).detach().to(dtype=torch.float32)
@@ -1165,7 +1247,10 @@ class RayPPOTrainer:
             # 当前 step 是否使用 EMA policy 估计 J_f；1 表示启用，0 表示关闭。
             "self_distillation/uplift_jf_policy_ema_policy": float(jf_policy == "ema_policy"),
         }
-        return DataProto.from_dict(tensors={"self_distillation_u": u}), metrics
+        return DataProto.from_dict(
+            tensors={"self_distillation_u": u},
+            meta_info={"teacher_rollout_dump_infos": teacher_rollout_dump_infos},
+        ), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
@@ -2149,6 +2234,7 @@ class RayPPOTrainer:
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    rollout_dump_extra_infos: dict[str, list[Any]] = {}
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -2170,6 +2256,11 @@ class RayPPOTrainer:
                                     reward_tensor=reward_tensor,
                                     timing_raw=timing_raw,
                                 )
+                                teacher_rollout_dump_infos = uplift_batch.meta_info.pop(
+                                    "teacher_rollout_dump_infos", {}
+                                )
+                                if teacher_rollout_dump_infos:
+                                    rollout_dump_extra_infos.update(teacher_rollout_dump_infos)
                                 self_distillation_batch = self_distillation_batch.union(uplift_batch)
                                 # calibration 用的 prompt 字段只服务于估计 self_distillation_u，
                                 # actor update 不需要这些临时字段，合并主 batch 前清理掉。
@@ -2245,7 +2336,13 @@ class RayPPOTrainer:
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        self._log_rollout_data(
+                            batch,
+                            reward_extra_infos_dict,
+                            timing_raw,
+                            rollout_data_dir,
+                            extra_infos_to_dump=rollout_dump_extra_infos,
+                        )
 
                 # validate
                 if (
