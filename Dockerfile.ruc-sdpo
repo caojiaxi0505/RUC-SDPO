@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.6
+#
+# Docker image for GRPO / SDPO / UC-SDPO experiments with optional SSH server.
+#
+# Build:
+#   docker build -f Dockerfile.ucsdpo -t ucsdpo:latest .
+#
+# Run:
+#   docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+#     -v "$PWD":/users/sdpo/SDPO \
+#     -v "$HOME/.cache/huggingface":/cache/huggingface \
+#     -p 2222:22 \
+#     -it ucsdpo:latest
+
+ARG BASE_IMAGE=nvcr.io/nvidia/vllm:25.12.post1-py3
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG REQUIREMENTS_FILE=requirements.txt
+ARG INSTALL_TEST_DEPS=false
+ARG INSTALL_FLASH_ATTN=false
+ARG SDPO_USER=sdpo
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    USER=${SDPO_USER} \
+    ROCR_VISIBLE_DEVICES="" \
+    VLLM_USE_V1=1 \
+    NCCL_DEBUG=WARN \
+    HF_HOME=/cache/huggingface \
+    TRANSFORMERS_CACHE=/cache/huggingface \
+    WANDB_DIR=/users/${SDPO_USER}/SDPO/wandb \
+    PROJECT_ROOT=/users/${SDPO_USER}/SDPO \
+    PYTHONPATH=/users/${SDPO_USER}/SDPO:${PYTHONPATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    wget \
+    build-essential \
+    cmake \
+    ninja-build \
+    libsndfile1 \
+    libgl1 \
+    libglib2.0-0 \
+    openssh-server \
+    && mkdir -p /var/run/sshd \
+    && ssh-keygen -A \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /users/${SDPO_USER}/SDPO
+
+# Copy dependency metadata first for Docker layer caching.
+COPY requirements*.txt pyproject.toml setup.py README.md ./
+COPY verl/version/version ./verl/version/version
+
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir -r ${REQUIREMENTS_FILE} && \
+    if [ "${INSTALL_TEST_DEPS}" = "true" ]; then \
+      python -m pip install --no-cache-dir -r requirements-test.txt pytest; \
+    fi && \
+    if [ "${INSTALL_FLASH_ATTN}" = "true" ]; then \
+      python -m pip install --no-cache-dir flash-attn --no-build-isolation; \
+    fi
+
+# Copy the full codebase, including the UC-SDPO modifications.
+COPY . .
+
+# Install local verl/SDPO without dependency resolution to preserve the base
+# CUDA/PyTorch/vLLM stack and the versions installed above.
+RUN python -m pip install --no-cache-dir -e . --no-deps && \
+    python -m py_compile \
+      verl/trainer/ppo/core_algos.py \
+      verl/trainer/ppo/ray_trainer.py \
+      verl/workers/actor/dp_actor.py \
+      verl/workers/config/actor.py
+
+RUN mkdir -p /cache/huggingface /users/${SDPO_USER}/SDPO/wandb
+
+EXPOSE 22
+
+CMD ["/bin/bash"]
