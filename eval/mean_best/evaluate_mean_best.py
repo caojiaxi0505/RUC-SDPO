@@ -52,7 +52,7 @@ tooluse_reward = load_module("verl.utils.reward_score.feedback.tooluse", FEEDBAC
 
 CODE_SOURCES = {"code", "livecodebench", "humanevalplus", "taco"}
 MATH_SOURCES = {"math", "math500", "dapo_math", "gsm8k", "openr1_math"}
-MCQ_SOURCES = {"sciknoweval", "scienceqa"}
+MCQ_SOURCES = {"sciknoweval", "scienceqa", "medmcqa"}
 BEST_OF_K_METRICS = {"score", "acc"}
 
 
