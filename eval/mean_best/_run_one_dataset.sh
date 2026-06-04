@@ -220,7 +220,7 @@ start_or_reuse_server() {
     MODEL_PATH="${MODEL_PATH}" \
     SERVED_MODEL_NAME="${MODEL_NAME}" \
     PYTHON_BIN="${PYTHON_BIN}" \
-    HOST="${HOST}" PORT="${PORT}" TP_SIZE="${TP_SIZE}" \
+    HOST="${HOST}" PORT="${PORT}" TP_SIZE="${TP_SIZE}" DP_SIZE="${DP_SIZE}" \
     GPU_MEM_UTIL="${GPU_MEM_UTIL}" MAX_MODEL_LEN="${MAX_MODEL_LEN}" DTYPE="${DTYPE}" \
       setsid bash "${HERE}/serve_vllm.sh" >"${SERVER_LOG}" 2>&1 &
     SERVER_PGID=$!
@@ -228,7 +228,7 @@ start_or_reuse_server() {
     MODEL_PATH="${MODEL_PATH}" \
     SERVED_MODEL_NAME="${MODEL_NAME}" \
     PYTHON_BIN="${PYTHON_BIN}" \
-    HOST="${HOST}" PORT="${PORT}" TP_SIZE="${TP_SIZE}" \
+    HOST="${HOST}" PORT="${PORT}" TP_SIZE="${TP_SIZE}" DP_SIZE="${DP_SIZE}" \
     GPU_MEM_UTIL="${GPU_MEM_UTIL}" MAX_MODEL_LEN="${MAX_MODEL_LEN}" DTYPE="${DTYPE}" \
       bash "${HERE}/serve_vllm.sh" >"${SERVER_LOG}" 2>&1 &
     SERVER_PGID=""
@@ -292,6 +292,7 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
 BASE_URL=${BASE_URL:-"http://${HOST}:${PORT}/v1"}
 TP_SIZE=${TP_SIZE:-4}
+DP_SIZE=${DP_SIZE:-1}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-18944}
 DTYPE=${DTYPE:-bfloat16}
@@ -323,6 +324,7 @@ echo "[eval] run label   : ${RUN_LABEL}"
 echo "[eval] model name  : ${MODEL_NAME}"
 echo "[eval] python      : ${PYTHON_BIN}"
 echo "[eval] endpoint    : ${BASE_URL}"
+echo "[eval] parallel    : tp=${TP_SIZE} dp=${DP_SIZE}"
 echo "[eval] samples     : ${NUM_SAMPLES} (ks=${METRIC_KS:-auto})"
 echo "[eval] decoding    : temperature=${TEMPERATURE} top_p=${TOP_P} top_k=${TOP_K} max_tokens=${MAX_TOKENS}"
 echo "[eval] eval root   : ${EVAL_ROOT}"

@@ -10,6 +10,7 @@ PYTHON_BIN=${PYTHON_BIN:-}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
 TP_SIZE=${TP_SIZE:-4}
+DP_SIZE=${DP_SIZE:-1}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-18944}
 DTYPE=${DTYPE:-bfloat16}
@@ -25,7 +26,7 @@ fi
 
 echo "[serve] MODEL_PATH=${MODEL_PATH}"
 echo "[serve] SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
-echo "[serve] HOST=${HOST} PORT=${PORT} TP_SIZE=${TP_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN}"
+echo "[serve] HOST=${HOST} PORT=${PORT} TP_SIZE=${TP_SIZE} DP_SIZE=${DP_SIZE} MAX_MODEL_LEN=${MAX_MODEL_LEN}"
 
 "${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
   --model "${MODEL_PATH}" \
@@ -33,6 +34,7 @@ echo "[serve] HOST=${HOST} PORT=${PORT} TP_SIZE=${TP_SIZE} MAX_MODEL_LEN=${MAX_M
   --host "${HOST}" \
   --port "${PORT}" \
   --tensor-parallel-size "${TP_SIZE}" \
+  --data-parallel-size "${DP_SIZE}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --dtype "${DTYPE}" \

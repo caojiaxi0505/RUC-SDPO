@@ -24,7 +24,8 @@ Useful overrides:
   EVAL_ROOT=/path/to/output
   STEP=630                    # only needed when <weight-path> is a run directory
   SKIP_SERVER_SETUP=1         # reuse BASE_URL, but <weight-path> is still required
-  PORT=8001 NUM_SAMPLES=16 TEMPERATURE=0.6 TOP_P=0.95 TOP_K=-1
+  PORT=8001 TP_SIZE=4 DP_SIZE=1 NUM_SAMPLES=16
+  TEMPERATURE=0.6 TOP_P=0.95 TOP_K=-1
   METRIC_KS=1,2,4,8,16
 USAGE
 }
