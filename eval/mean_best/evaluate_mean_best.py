@@ -153,6 +153,7 @@ def request_chat_completions(
     top_p: float,
     top_k: int,
     max_tokens: int,
+    chat_template_kwargs: dict[str, Any],
     seed: int | None,
     timeout: float,
     retries: int,
@@ -168,6 +169,8 @@ def request_chat_completions(
         "max_tokens": max_tokens,
         "n": num_samples,
     }
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
     if seed is not None:
         payload["seed"] = seed
 
@@ -220,6 +223,7 @@ def make_generation_record(row: JsonDict, args: argparse.Namespace, uid: str, ro
             top_p=args.top_p,
             top_k=args.top_k,
             max_tokens=args.max_tokens,
+            chat_template_kwargs=args.chat_template_kwargs,
             seed=seed,
             timeout=args.request_timeout,
             retries=args.retries,
@@ -466,6 +470,7 @@ def build_summary(scored_rows: list[JsonDict], args: argparse.Namespace, ks: lis
         "top_p": args.top_p,
         "top_k": args.top_k,
         "max_tokens": args.max_tokens,
+        "chat_template_kwargs": args.chat_template_kwargs,
         "overall": aggregate_group(scored_rows, ks),
         "by_data_source": {source: aggregate_group(rows, ks) for source, rows in sorted(by_source.items())},
     }
@@ -483,6 +488,7 @@ def write_summary_text(summary: JsonDict, path: Path) -> None:
         f"top_p: {summary['top_p']}",
         f"top_k: {summary['top_k']}",
         f"max_tokens: {summary['max_tokens']}",
+        f"chat_template_kwargs: {json_dumps(summary.get('chat_template_kwargs', {}))}",
         "",
     ]
     for metric_name in ["score", "acc"]:
@@ -517,6 +523,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--max-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--chat-template-kwargs-json",
+        default="",
+        help="JSON object forwarded to vLLM chat_template_kwargs, e.g. '{\"enable_thinking\": false}'.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Base sampling seed. Use -1 to omit seed.")
     parser.add_argument("--concurrency", type=int, default=8, help="Concurrent API requests.")
     parser.add_argument("--request-timeout", type=float, default=600.0)
@@ -533,6 +544,13 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--concurrency must be positive")
     if args.seed == -1:
         args.seed = None
+    if args.chat_template_kwargs_json:
+        parsed_kwargs = json.loads(args.chat_template_kwargs_json)
+        if not isinstance(parsed_kwargs, dict):
+            raise ValueError("--chat-template-kwargs-json must decode to a JSON object")
+        args.chat_template_kwargs = parsed_kwargs
+    else:
+        args.chat_template_kwargs = {}
     return args
 
 

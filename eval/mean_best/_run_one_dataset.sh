@@ -243,6 +243,7 @@ run_evaluator() {
 
   [[ -n "${METRIC_KS}" ]] && extra_args+=(--metric-ks "${METRIC_KS}")
   [[ -n "${LIMIT}" ]] && extra_args+=(--limit "${LIMIT}")
+  [[ -n "${CHAT_TEMPLATE_KWARGS_JSON}" ]] && extra_args+=(--chat-template-kwargs-json "${CHAT_TEMPLATE_KWARGS_JSON}")
   [[ "${OVERWRITE}" == "1" ]] && extra_args+=(--overwrite)
 
   export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
@@ -312,6 +313,7 @@ RETRIES=${RETRIES:-3}
 GENERATION_SEED=${GENERATION_SEED:-42}
 LIMIT=${LIMIT:-}
 OVERWRITE=${OVERWRITE:-0}
+CHAT_TEMPLATE_KWARGS_JSON=${CHAT_TEMPLATE_KWARGS_JSON:-}
 
 mkdir -p "${OUT_DIR}" "${LOG_DIR}"
 [[ -f "${DATASET_FILE}" ]] || fail "missing DATASET_FILE=${DATASET_FILE}"
@@ -327,6 +329,7 @@ echo "[eval] endpoint    : ${BASE_URL}"
 echo "[eval] parallel    : tp=${TP_SIZE} dp=${DP_SIZE}"
 echo "[eval] samples     : ${NUM_SAMPLES} (ks=${METRIC_KS:-auto})"
 echo "[eval] decoding    : temperature=${TEMPERATURE} top_p=${TOP_P} top_k=${TOP_K} max_tokens=${MAX_TOKENS}"
+echo "[eval] chat kwargs : ${CHAT_TEMPLATE_KWARGS_JSON:-{}}"
 echo "[eval] eval root   : ${EVAL_ROOT}"
 echo "=================================================================="
 

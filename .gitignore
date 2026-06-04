@@ -139,4 +139,5 @@ datasets/toolace
 datasets/openr1_math
 datasets/scienceqa
 datasets/taco
+datasets/medmcqa
 eval_outputs/
