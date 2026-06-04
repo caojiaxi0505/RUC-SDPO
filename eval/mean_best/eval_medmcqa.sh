@@ -9,4 +9,4 @@ if [[ -z "${CHAT_TEMPLATE_KWARGS_JSON:-}" ]]; then
   export CHAT_TEMPLATE_KWARGS_JSON='{"enable_thinking":false}'
 fi
 
-run_mean_best_entrypoint scienceqa 8192 "$@"
+run_mean_best_entrypoint medmcqa 8192 "$@"

@@ -329,7 +329,11 @@ echo "[eval] endpoint    : ${BASE_URL}"
 echo "[eval] parallel    : tp=${TP_SIZE} dp=${DP_SIZE}"
 echo "[eval] samples     : ${NUM_SAMPLES} (ks=${METRIC_KS:-auto})"
 echo "[eval] decoding    : temperature=${TEMPERATURE} top_p=${TOP_P} top_k=${TOP_K} max_tokens=${MAX_TOKENS}"
-echo "[eval] chat kwargs : ${CHAT_TEMPLATE_KWARGS_JSON:-{}}"
+if [[ -n "${CHAT_TEMPLATE_KWARGS_JSON}" ]]; then
+  echo "[eval] chat kwargs : ${CHAT_TEMPLATE_KWARGS_JSON}"
+else
+  echo "[eval] chat kwargs : {}"
+fi
 echo "[eval] eval root   : ${EVAL_ROOT}"
 echo "=================================================================="
 
