@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import hashlib
+import gc
 import json
 import logging
 import os
@@ -2370,6 +2371,30 @@ class RayPPOTrainer:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
+                batch_metrics_collected = False
+                if is_last_step:
+                    # final step 会紧接着保存 checkpoint。先把依赖训练 batch 的指标算完，
+                    # 再释放 batch，避免 validation 刚结束后保存 ckpt 时仍持有完整 rollout batch。
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                    gradient_norm = metrics.get("actor/grad_norm", None)
+                    metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                    if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                        self.train_dataloader.sampler.update(batch=batch)
+                    batch_metrics_collected = True
+                    del batch
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
@@ -2408,25 +2433,34 @@ class RayPPOTrainer:
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
                 # training metrics
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
-                )
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # compute variance proxy metrics
-                gradient_norm = metrics.get("actor/grad_norm", None)
-                metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+                if batch_metrics_collected:
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    metrics.update({f"timing_s/{name}": value for name, value in timing_raw.items()})
+                else:
+                    metrics.update(
+                        {
+                            "training/global_step": self.global_steps,
+                            "training/epoch": epoch,
+                        }
+                    )
+                    # collect metrics
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    # TODO: implement actual tflpo and theoretical tflpo
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                    # compute variance proxy metrics
+                    gradient_norm = metrics.get("actor/grad_norm", None)
+                    metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                    # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-                if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                if (not batch_metrics_collected) and isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
