@@ -567,11 +567,11 @@ def convert_toolace(root: Path, val_ratio: float, seed: int) -> None:
             add_stat(stats, "turn/assistant_call_total")
 
             context = conversations[:turn_idx]
-            if not context:
-                add_stat(stats, "skip_turn/no_context")
-                continue
-            if context[-1].get("from") == "assistant":
-                add_stat(stats, "skip_turn/prev_assistant")
+            # ToolACE 训练目标是“根据最新 user 请求预测下一次 tool call”。
+            # 只保留 assistant tool-call 前一轮正好是 user 的样本，和旧 SDPO 目录的数据构造保持一致。
+            if not context or context[-1].get("from") != "user":
+                prev_role = "none" if not context else str(context[-1].get("from", "unknown"))
+                add_stat(stats, f"skip_turn/prev_{prev_role}")
                 continue
 
             source_id = f"{source_group}-turn{turn_idx}"
