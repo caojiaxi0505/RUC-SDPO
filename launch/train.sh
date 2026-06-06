@@ -30,6 +30,7 @@ Common environment overrides:
   VAL_BEFORE_TRAIN
   JF_POLICY, UPLIFT_AGGREGATION, UPLIFT_NUM_SAMPLES
   AUXILIARY_COEF, ALPHA, DISTILLATION_TOPK
+  TACO_BATCH_VERIFIER_URL, TACO_VERIFIER_MAX_TEST_CASES
 EOF
 }
 
@@ -165,6 +166,16 @@ COMMON_ARGS=(
 
 [[ -n "${TRAIN_MAX_SAMPLES:-}" ]] && COMMON_ARGS+=("data.train_max_samples=${TRAIN_MAX_SAMPLES}")
 COMMON_ARGS+=("data.val_max_samples=${VAL_MAX_SAMPLES}")
+
+if [[ "${DATASET_NAME}" == "taco" && -n "${TACO_BATCH_VERIFIER_URL:-}" ]]; then
+  COMMON_ARGS+=(
+    "reward_model.reward_manager=taco_batch"
+    "+reward_model.reward_kwargs.server_url=${TACO_BATCH_VERIFIER_URL}"
+  )
+  [[ -n "${TACO_VERIFIER_MAX_TEST_CASES:-}" ]] && COMMON_ARGS+=(
+    "+reward_model.reward_kwargs.max_test_cases=${TACO_VERIFIER_MAX_TEST_CASES}"
+  )
+fi
 
 DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
 ALPHA="${ALPHA:-0.5}"
