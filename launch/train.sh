@@ -78,8 +78,8 @@ else
   DATASET_DIR="${PROJECT_DIR}/datasets/${DATASET_NAME}"
 fi
 
-TRAIN_FILE="${DATASET_DIR}/train.jsonl"
-VAL_FILE="${DATASET_DIR}/test.jsonl"
+TRAIN_FILE="${DATASET_DIR}/train.parquet"
+VAL_FILE="${DATASET_DIR}/test.parquet"
 if [[ ! -f "${TRAIN_FILE}" || ! -f "${VAL_FILE}" ]]; then
   echo "ERROR: missing ${TRAIN_FILE} or ${VAL_FILE}" >&2
   echo "Run the dataset conversion script before launching training." >&2
@@ -124,7 +124,7 @@ case "${DATASET_NAME}" in
     TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:-6400}"
     ;;
 esac
-# 快速迭代默认只从 test.jsonl 中采样 64 条做 validation；设为 -1 可恢复全量验证。
+# 快速迭代默认只从 test.parquet 中采样 64 条做 validation；设为 -1 可恢复全量验证。
 VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-64}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-True}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
