@@ -29,7 +29,7 @@ Common environment overrides:
   TRAIN_MAX_SAMPLES, VAL_MAX_SAMPLES, DATA_SEED, DATA_SHUFFLE
   VAL_BEFORE_TRAIN
   JF_POLICY, UPLIFT_AGGREGATION, UPLIFT_NUM_SAMPLES
-  AUXILIARY_COEF, ALPHA, DISTILLATION_TOPK
+  AUXILIARY_COEF, ALPHA, DISTILLATION_TOPK, DISTILLATION_TEACHER_POLICY
   TACO_BATCH_VERIFIER_URL, TACO_VERIFIER_MAX_TEST_CASES
 EOF
 }
@@ -178,6 +178,7 @@ if [[ "${DATASET_NAME}" == "taco" && -n "${TACO_BATCH_VERIFIER_URL:-}" ]]; then
 fi
 
 DISTILLATION_TOPK="${DISTILLATION_TOPK:-100}"
+DISTILLATION_TEACHER_POLICY="${DISTILLATION_TEACHER_POLICY:-ema_policy}"
 ALPHA="${ALPHA:-0.5}"
 JF_POLICY="${JF_POLICY:-ema_policy}"
 UPLIFT_NUM_SAMPLES="${UPLIFT_NUM_SAMPLES:-1}"
@@ -192,6 +193,7 @@ case "${METHOD}" in
   sdpo)
     METHOD_ARGS+=(
       "actor_rollout_ref.actor.self_distillation.objective=jsd"
+      "actor_rollout_ref.actor.self_distillation.distillation_teacher_policy=${DISTILLATION_TEACHER_POLICY}"
       "actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILLATION_TOPK}"
       "actor_rollout_ref.actor.self_distillation.alpha=${ALPHA}"
       "actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=True"
@@ -202,6 +204,7 @@ case "${METHOD}" in
   ruc-sdpo)
     METHOD_ARGS+=(
       "actor_rollout_ref.actor.self_distillation.objective=ruc-sdpo"
+      "actor_rollout_ref.actor.self_distillation.distillation_teacher_policy=${DISTILLATION_TEACHER_POLICY}"
       "actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILLATION_TOPK}"
       "actor_rollout_ref.actor.self_distillation.alpha=${ALPHA}"
       "actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=True"
@@ -216,6 +219,7 @@ case "${METHOD}" in
   ruc-sdpo-grpo)
     METHOD_ARGS+=(
       "actor_rollout_ref.actor.self_distillation.objective=ruc-sdpo-grpo"
+      "actor_rollout_ref.actor.self_distillation.distillation_teacher_policy=${DISTILLATION_TEACHER_POLICY}"
       "actor_rollout_ref.actor.self_distillation.auxiliary_coef=${AUXILIARY_COEF}"
       "actor_rollout_ref.actor.self_distillation.auxiliary_base_loss_mode=vanilla"
       "actor_rollout_ref.actor.self_distillation.distillation_topk=${DISTILLATION_TOPK}"

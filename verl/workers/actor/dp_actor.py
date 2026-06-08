@@ -786,8 +786,14 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
-                    if teacher_regularization == "trust-region" and self.use_fused_kernels:
-                        raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
+                    distillation_teacher_policy = self_distillation_cfg.get(
+                        "distillation_teacher_policy", "ema_policy"
+                    )
+                    if distillation_teacher_policy not in {"ema_policy", "actor"}:
+                        raise ValueError(
+                            "self_distillation.distillation_teacher_policy must be one of "
+                            f"{{'ema_policy', 'actor'}}, got {distillation_teacher_policy!r}"
+                        )
                     # all return: (bsz, response_length)
                     return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
@@ -826,11 +832,20 @@ class DataParallelPPOActor(BasePPOActor):
                             "attention_mask": model_inputs["teacher_attention_mask"],
                             "position_ids": model_inputs["teacher_position_ids"],
                         }
-                        teacher_model = self.teacher_module or self.actor_module
-                        if teacher_regularization == "trust-region" and (
-                            self.teacher_module is None or self.teacher_module is self.actor_module
-                        ):
-                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                        if distillation_teacher_policy == "ema_policy":
+                            if teacher_regularization != "ema":
+                                raise ValueError(
+                                    "distillation_teacher_policy='ema_policy' requires "
+                                    "self_distillation.teacher_regularization='ema'."
+                                )
+                            if self.teacher_module is None or self.teacher_module is self.actor_module:
+                                raise ValueError(
+                                    "distillation_teacher_policy='ema_policy' requires a separate EMA teacher_module."
+                                )
+                            teacher_model = self.teacher_module
+                        else:
+                            # Current(pc) 只作为 teacher target 使用，后续 forward 会放在 torch.no_grad() 中。
+                            teacher_model = self.actor_module
                         if ruc_sdpo_grpo_enabled:
                             base_loss_mode = self_distillation_cfg.get("auxiliary_base_loss_mode", "vanilla")
                             if base_loss_mode == "sdpo":
@@ -913,6 +928,12 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             pg_metrics["self_distillation/objective_ruc_sdpo_grpo"] = 0.0
 
+                        pg_metrics["self_distillation/distillation_teacher_policy_actor"] = float(
+                            distillation_teacher_policy == "actor"
+                        )
+                        pg_metrics["self_distillation/distillation_teacher_policy_ema_policy"] = float(
+                            distillation_teacher_policy == "ema_policy"
+                        )
                         pg_metrics["self_distillation/empty_target_batch"] = float(self_distillation_mask.sum().item() == 0)
                         micro_batch_metrics.update(pg_metrics)
                     else:

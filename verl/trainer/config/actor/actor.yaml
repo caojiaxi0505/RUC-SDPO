@@ -116,6 +116,11 @@ self_distillation:
   # EMA update rate for teacher weights, or trust-region mixing coefficient
   teacher_update_rate: 0.05 
 
+  # 蒸馏时 pc teacher logits 的来源：
+  # - "ema_policy": EMA(pc) vs Current(w/o pc)，保持当前默认行为。
+  # - "actor": Current(pc) vs Current(w/o pc)，Current(pc) 只作为 stop-gradient teacher。
+  distillation_teacher_policy: ema_policy
+
   # Maximum length of the reprompted prompt
   max_reprompt_len: 10240
 

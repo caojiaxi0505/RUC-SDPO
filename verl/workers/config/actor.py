@@ -49,6 +49,7 @@ class SelfDistillationConfig(BaseConfig):
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
         teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
+        distillation_teacher_policy (str): 蒸馏时 pc teacher logits 的来源。"ema_policy" 表示 EMA(pc)；"actor" 表示 Current(pc)，且作为 stop-gradient teacher 使用。
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
         max_reprompt_len (int): Maximum length of the reprompted prompt.
@@ -77,6 +78,7 @@ class SelfDistillationConfig(BaseConfig):
     success_reward_threshold: float = 1.0
     teacher_regularization: str = "ema"
     teacher_update_rate: float = 0.05
+    distillation_teacher_policy: str = "ema_policy"
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
     max_reprompt_len: int = 10240
@@ -155,6 +157,17 @@ class SelfDistillationConfig(BaseConfig):
         if not 0.0 <= self.teacher_update_rate <= 1.0:
             raise ValueError(
                 f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}"
+            )
+        valid_distillation_teacher_policies = {"ema_policy", "actor"}
+        if self.distillation_teacher_policy not in valid_distillation_teacher_policies:
+            raise ValueError(
+                "self_distillation.distillation_teacher_policy must be one of "
+                f"{valid_distillation_teacher_policies}, got {self.distillation_teacher_policy}"
+            )
+        if self.distillation_teacher_policy == "ema_policy" and self.teacher_regularization != "ema":
+            raise ValueError(
+                "self_distillation.distillation_teacher_policy='ema_policy' requires "
+                "self_distillation.teacher_regularization='ema'"
             )
         if self.distillation_topk is not None and self.distillation_topk <= 0:
             raise ValueError(
