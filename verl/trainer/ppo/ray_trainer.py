@@ -1076,7 +1076,12 @@ class RayPPOTrainer:
                 elif not self.async_rollout_mode:
                     calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
                 else:
-                    calibration_output_padded = self.async_rollout_manager.generate_sequences(calibration_prompts_padded)
+                    # actor 作为 J_f estimator 时也必须走 tokenized prompt 专用路径。
+                    # 通用 AgentLoop 会重新消费 raw_prompt，返回的 prompt_ids 长度随样本变化，
+                    # DataProto 拼接时会在 _postprocess 中因为 prompt 维度不一致而失败。
+                    calibration_output_padded = self.async_rollout_manager.generate_sequences_from_tokens(
+                        calibration_prompts_padded
+                    )
                 uplift_timing = calibration_output_padded.meta_info.pop("timing", {})
                 timing_raw.update({f"self_distillation_uplift/{k}": v for k, v in uplift_timing.items()})
             calibration_output = unpad_dataproto(calibration_output_padded, pad_size=pad_size)
