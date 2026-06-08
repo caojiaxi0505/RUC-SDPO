@@ -401,6 +401,48 @@ def _short_trace(e, limit=3):
     return "\n".join(lines)
 
 
+def _functional_call_args(test_input):
+    if isinstance(test_input, dict):
+        return (), test_input
+    if isinstance(test_input, (list, tuple)):
+        return list(test_input), None
+    if isinstance(test_input, str):
+        stripped = test_input.strip()
+        if not stripped:
+            return [], None
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return (), parsed
+            if isinstance(parsed, (list, tuple)):
+                return list(parsed), None
+            return [parsed], None
+        except Exception:
+            return [json.loads(x) for x in stripped.split()], None
+    return [test_input], None
+
+
+def _expected_functional_output(test_output):
+    if isinstance(test_output, str):
+        try:
+            test_output = json.loads(test_output)
+        except Exception:
+            return test_output
+    # TACO functional outputs are stored as a list of return values. After
+    # indexing one testcase, unwrap that single return value before comparison.
+    if isinstance(test_output, (list, tuple)) and len(test_output) == 1:
+        return test_output[0]
+    return test_output
+
+
+def _stdio_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(item) for item in value) + "\n"
+    return str(value)
+
+
 def run_test_func(completion, test_input, test_output, fn_name, namespace=None):
     namespace = _create_sandbox_namespace() if namespace is None else namespace
     # compile with postponed annotations (equivalent to: from __future__ import annotations)
@@ -439,16 +481,16 @@ def run_test_func(completion, test_input, test_output, fn_name, namespace=None):
     old_stderr = _capture_stderr(namespace)
 
     try:
-        if isinstance(test_input, dict):
-            result_output = namespace[func_name](**test_input)
+        args, kwargs = _functional_call_args(test_input)
+        if kwargs is not None:
+            result_output = namespace[func_name](**kwargs)
         else:
-            test_input_args = [json.loads(x) for x in test_input.split()]
-            result_output = namespace[func_name](*test_input_args)
+            result_output = namespace[func_name](*args)
 
         # Enforce structural, JSON-like equality; reject custom objects
         try:
             lhs = _to_safe_jsonable(result_output)
-            rhs = _to_safe_jsonable(json.loads(test_output))
+            rhs = _to_safe_jsonable(_expected_functional_output(test_output))
             lhs_dump = json.dumps(lhs, sort_keys=True, separators=(",", ":"))
             rhs_dump = json.dumps(rhs, sort_keys=True, separators=(",", ":"))
             if lhs_dump != rhs_dump:
@@ -474,11 +516,11 @@ def run_test_std(completion, test_input, test_output, namespace=None):
     old_stderr = _capture_stderr(namespace)
     try:
         sys.stdout = output
-        sys.stdin = io.StringIO(test_input)
+        sys.stdin = io.StringIO(_stdio_text(test_input))
         code_obj = compile('__name__ = "__main__"\n' + completion, FILENAME, "exec")
         _exec_with_isolated_locals(code_obj, namespace)
         out = output.getvalue().strip().replace("\n", " ").replace("\r", "")
-        expected = test_output.strip().replace("\n", " ").replace("\r", "")
+        expected = _stdio_text(test_output).strip().replace("\n", " ").replace("\r", "")
         return out == expected, output.getvalue().strip()
     except BaseException as e:
         return False, f"{ERROR_PREFIX}{_short_trace(e)}"
@@ -536,9 +578,10 @@ def run_tests_for_one_example(test_cases, completion, send_conn, sparse_rewards,
                     completion, copy.deepcopy(test_input), copy.deepcopy(test_output), fn_name, globals
                 )
             elif test_type == "stdin":
-                test_output = test_output.strip()
-                if test_output.endswith("-"):
-                    test_output = test_output[: test_output.rfind("-")].rstrip()  # Remove '-' if present and trailing
+                if isinstance(test_output, str):
+                    test_output = test_output.strip()
+                    if test_output.endswith("-"):
+                        test_output = test_output[: test_output.rfind("-")].rstrip()  # Remove '-' if present and trailing
                 passed, output_value = run_test_std(
                     completion, copy.deepcopy(test_input), copy.deepcopy(test_output), globals
                 )
@@ -762,86 +805,77 @@ def run_tests(test_cases: dict, solution, sparse_rewards, max_test_cases):
     timeout_per_test_case = float(test_cases["time_limit"]) if test_cases["time_limit"] is not None else DEFAULT_TIMEOUT
 
     records = []
-    process_data = []
 
     for test_idx in range(num_test_cases):
-        parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
-        p = multiprocessing.Process(target=run_tests_for_one_example, args=(test_cases, completion, child_conn, sparse_rewards, test_idx))
-        p.start()
-        child_conn.close()  # Close in parent to avoid resource leaks
-        process_data.append({"process": p, "parent_conn": parent_conn})
+        parent_conn = None
+        child_conn = None
+        process = None
+        try:
+            parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+            process = multiprocessing.Process(
+                target=run_tests_for_one_example,
+                args=(test_cases, completion, child_conn, sparse_rewards, test_idx),
+            )
+            process.start()
+            child_conn.close()
+            child_conn = None
 
-    start_time = time.time()
-    for test_idx, data in enumerate(process_data):
-        p = data["process"]
-        parent_conn = data["parent_conn"]
-
-        # timeout for a single test; since all tests have started in parallel, we need to calculate the remaining time for each test
-        timeout_this_test = max(0, timeout_per_test_case * TIMEOUT_SCALER + 1 - (time.time() - start_time))
-        if parent_conn.poll(timeout_this_test):
-            try:
-                # receive the result from the child process
-                result = parent_conn.recv()
-            except Exception as e:
-                # any other error (eg process died without sending a result)
+            timeout_this_test = timeout_per_test_case * TIMEOUT_SCALER + 1
+            if parent_conn.poll(timeout_this_test):
+                try:
+                    result = parent_conn.recv()
+                except Exception as e:
+                    result = {
+                        "test_idx": test_idx,
+                        "input": test_cases["inputs"][test_idx],
+                        "expected": test_cases["outputs"][test_idx],
+                        "actual": f"Process Error: {_short_trace(e)}",
+                        "passed": False,
+                        "debug": "",
+                        "time": float("inf"),
+                    }
+            else:
                 result = {
                     "test_idx": test_idx,
                     "input": test_cases["inputs"][test_idx],
                     "expected": test_cases["outputs"][test_idx],
-                    "actual": f"Process Error: {_short_trace(e)}",
+                    "actual": TIMEOUT,
                     "passed": False,
                     "debug": "",
                     "time": float("inf"),
                 }
-        else:
-            # process timed out
+        except Exception as e:
             result = {
                 "test_idx": test_idx,
                 "input": test_cases["inputs"][test_idx],
                 "expected": test_cases["outputs"][test_idx],
-                "actual": TIMEOUT,
+                "actual": f"Process Error: {_short_trace(e)}",
                 "passed": False,
                 "debug": "",
                 "time": float("inf"),
             }
+        finally:
+            if child_conn is not None:
+                child_conn.close()
+            if process is not None and process.pid is not None:
+                process.join(timeout=0)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                try:
+                    process.close()
+                except Exception:
+                    pass
+            if parent_conn is not None:
+                parent_conn.close()
 
         records.append(result)
-
-        # clean-up process
-        p.join(timeout=0)
-        if p.is_alive():
-            p.kill()
-            p.join()
 
     assert len(records) == num_test_cases
     return records
 
 
-def compute_score(solution: str, ground_truth: str, extra_info = None, sparse_rewards=False, max_test_cases=None):
-    split = extra_info["split"]
-    was_truncated = extra_info.get("truncated", False)
-
-    if split == "test":
-        sparse_rewards = True
-
-    try:
-        test_cases = json.loads(ground_truth)
-    except Exception:
-        print("Error when reading tests: " + ground_truth[:1000])
-        return {
-            "score": 0.0,
-            "acc": 0.0,
-            "pred": "",
-            "incorrect_format": 0,
-            "error_in_test_cases": 1,
-            "timed_out": 0,
-            "truncated": 1 if was_truncated else 0,
-            "truncated_and_missing_answer": 1 if was_truncated else 0,
-            "feedback": "Failed to parse ground truth test cases.",
-        }
-
-    records = run_tests(test_cases=test_cases, solution=solution, sparse_rewards=sparse_rewards, max_test_cases=max_test_cases if split != "test" else None)
-
+def score_from_records(records, *, split: str, was_truncated: bool, sparse_rewards: bool):
     correct_answers = [1.0 if r["passed"] else 0.0 for r in records]
     predictions = str([r["actual"] for r in records])[-5000:]
     accuracy = np.mean(correct_answers)
@@ -868,3 +902,41 @@ def compute_score(solution: str, ground_truth: str, extra_info = None, sparse_re
         "truncated_and_missing_answer": 1 if incorrect_format and was_truncated else 0,
         "feedback": format_test_feedback(records, was_truncated=was_truncated),
     }
+
+
+def compute_score(solution: str, ground_truth: str, extra_info = None, sparse_rewards=False, max_test_cases=None):
+    split = extra_info["split"]
+    was_truncated = extra_info.get("truncated", False)
+
+    if split == "test":
+        sparse_rewards = True
+
+    try:
+        test_cases = json.loads(ground_truth)
+    except Exception:
+        print("Error when reading tests: " + ground_truth[:1000])
+        return {
+            "score": 0.0,
+            "acc": 0.0,
+            "pred": "",
+            "incorrect_format": 0,
+            "error_in_test_cases": 1,
+            "timed_out": 0,
+            "truncated": 1 if was_truncated else 0,
+            "truncated_and_missing_answer": 1 if was_truncated else 0,
+            "feedback": "Failed to parse ground truth test cases.",
+        }
+
+    records = run_tests(
+        test_cases=test_cases,
+        solution=solution,
+        sparse_rewards=sparse_rewards,
+        max_test_cases=max_test_cases if split != "test" else None,
+    )
+
+    return score_from_records(
+        records,
+        split=split,
+        was_truncated=was_truncated,
+        sparse_rewards=sparse_rewards,
+    )

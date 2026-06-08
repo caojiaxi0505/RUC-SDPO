@@ -58,6 +58,7 @@ SGLANG_REQUIRES = [
 TRL_REQUIRES = ["trl<=0.9.6"]
 MCORE_REQUIRES = ["mbridge"]
 TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.5"]
+AGS_REQUIRES = ["e2b>=2.25.0"]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -70,6 +71,7 @@ extras_require = {
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
     "transferqueue": TRANSFERQUEUE_REQUIRES,
+    "ags": AGS_REQUIRES,
 }
 
 
