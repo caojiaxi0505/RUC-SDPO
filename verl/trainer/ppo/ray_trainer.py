@@ -30,6 +30,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
+from statistics import NormalDist
 from string import Template
 from typing import Any, Optional
 
@@ -679,6 +680,28 @@ class RayPPOTrainer:
         return output
 
     @staticmethod
+    def _wilson_lower(successes: torch.Tensor, counts: torch.Tensor, z: float) -> torch.Tensor:
+        counts_safe = counts.clamp(min=1.0)
+        phat = successes / counts_safe
+        z2 = z * z
+        denom = 1.0 + z2 / counts_safe
+        center = phat + z2 / (2.0 * counts_safe)
+        radius = z * torch.sqrt(phat * (1.0 - phat) / counts_safe + z2 / (4.0 * counts_safe * counts_safe))
+        lower = (center - radius) / denom
+        return torch.where(counts > 0, lower.clamp(min=0.0, max=1.0), torch.zeros_like(lower))
+
+    @staticmethod
+    def _wilson_upper(successes: torch.Tensor, counts: torch.Tensor, z: float) -> torch.Tensor:
+        counts_safe = counts.clamp(min=1.0)
+        phat = successes / counts_safe
+        z2 = z * z
+        denom = 1.0 + z2 / counts_safe
+        center = phat + z2 / (2.0 * counts_safe)
+        radius = z * torch.sqrt(phat * (1.0 - phat) / counts_safe + z2 / (4.0 * counts_safe * counts_safe))
+        upper = (center + radius) / denom
+        return torch.where(counts > 0, upper.clamp(min=0.0, max=1.0), torch.ones_like(upper))
+
+    @staticmethod
     def _remove_thinking_trace(text: str) -> str:
         """Remove <think>...</think> tags and their content from text."""
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
@@ -721,7 +744,9 @@ class RayPPOTrainer:
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return None
-        uplift_calibration_enabled = self_distillation_cfg.get("uplift_calibration", {}).get("enable", False)
+        uplift_cfg = self_distillation_cfg.get("uplift_calibration", {})
+        uplift_calibration_enabled = uplift_cfg.get("enable", False)
+        all_failed_only = bool(uplift_cfg.get("all_failed_only", False))
 
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
@@ -741,6 +766,14 @@ class RayPPOTrainer:
             batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold
         )
         response_indices_by_uid = self._collect_response_indices_by_uid(batch)
+        all_failed_by_uid = {
+            uid: len(success_by_uid[uid]) == 0
+            for uid in response_indices_by_uid
+        }
+        eligible_by_idx = [
+            (not all_failed_only) or all_failed_by_uid[batch.non_tensor_batch["uid"][i]]
+            for i in range(batch_size)
+        ]
         objective = self_distillation_cfg.get("objective", "jsd")
         ruc_objective = objective in {"ruc-sdpo", "ruc-sdpo-grpo"}
         random_select_solution_cfg = self_distillation_cfg.get("random_select_solution", None)
@@ -762,17 +795,26 @@ class RayPPOTrainer:
                 f"got {sample_from_all_non_self_solutions_cfg!r}"
             )
         sample_from_all_non_self_solutions = ruc_objective and sample_from_all_non_self_solutions_cfg
+        force_non_self_by_all_failed_only = all_failed_only and not sample_from_all_non_self_solutions
+        if all_failed_only:
+            # In an all-failed group there is no successful sibling by construction.
+            # Use non-self sibling responses as privileged context only for this opt-in path.
+            sample_from_all_non_self_solutions = True
         selected_solutions = [
-            self._get_solution(
-                i,
-                success_by_uid,
-                response_indices_by_uid,
-                batch.non_tensor_batch["uid"],
-                response_texts,
-                self_distillation_cfg.dont_reprompt_on_self_success,
-                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
-                random_select_solution,
-                sample_from_all_non_self_solutions,
+            (
+                self._get_solution(
+                    i,
+                    success_by_uid,
+                    response_indices_by_uid,
+                    batch.non_tensor_batch["uid"],
+                    response_texts,
+                    self_distillation_cfg.dont_reprompt_on_self_success,
+                    self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                    random_select_solution,
+                    sample_from_all_non_self_solutions,
+                )
+                if eligible_by_idx[i]
+                else None
             )
             for i in range(batch_size)
         ]
@@ -781,8 +823,8 @@ class RayPPOTrainer:
 
         def _build_teacher_message(i: int) -> list[dict]:
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
+            has_solution = eligible_by_idx[i] and solution_strs[i] is not None
+            has_feedback = eligible_by_idx[i] and feedback_list[i] is not None
             feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
 
             # If feedback_only_without_solution is True, only use feedback when no solution exists
@@ -843,18 +885,22 @@ class RayPPOTrainer:
         # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
         feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
         feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+            eligible_by_idx[i]
+            and feedback_list[i] is not None
+            and (not feedback_only_without_solution or solution_strs[i] is None)
             for i in range(batch_size)
         ]
 
         # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
         self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+            [eligible_by_idx[i] and (solution_strs[i] is not None or feedback_used[i]) for i in range(batch_size)],
             dtype=torch.float32,
             device=device
         )
 
         uids = set(batch.non_tensor_batch["uid"])
+        num_all_failed_uids = sum(1 for uid in uids if all_failed_by_uid[uid])
+        num_all_failed_samples = sum(1 for i in range(batch_size) if all_failed_by_uid[batch.non_tensor_batch["uid"][i]])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
         num_with_feedback_used = sum(1 for f in feedback_used if f)
         num_with_solution = sum(1 for s in solution_strs if s is not None)
@@ -875,12 +921,22 @@ class RayPPOTrainer:
             "self_distillation/random_select_solution": float(random_select_solution),
             # 当前 step 是否从所有非自己的 sibling response 中选 demonstration；1 表示启用，0 表示关闭。
             "self_distillation/sample_from_all_non_self_solutions": float(sample_from_all_non_self_solutions),
+            # all_failed_only=True 时会强制使用 non-self sibling context，因为全失败组没有 successful sibling。
+            "self_distillation/sample_from_all_non_self_forced_by_all_failed_only": float(
+                force_non_self_by_all_failed_only
+            ),
             # 当前 batch 中，reward function 返回了非空环境反馈的样本占比；只表示可用，不代表实际拼入 reprompt。
             "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
             # 当前 batch 中，最终实际拼入 reprompt 的环境反馈样本占比。
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             # 当前 batch 中，最终进入 self-distillation KL mask 的样本占比；有 demonstration 或实际使用 feedback 都计入。
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            # 当前 step 是否只允许 all-failed group 进入 RUC 蒸馏候选。
+            "self_distillation/all_failed_only": float(all_failed_only),
+            # 当前 batch 中没有任何成功 rollout 的 prompt/group 占比。
+            "self_distillation/all_failed_uid_fraction": num_all_failed_uids / len(uids),
+            # 当前 batch 中属于 all-failed prompt/group 的样本占比。
+            "self_distillation/all_failed_sample_fraction": num_all_failed_samples / batch_size,
         }
         tensors = {
             "teacher_input_ids": teacher_input_ids,
@@ -934,6 +990,18 @@ class RayPPOTrainer:
         eps = float(uplift_cfg.get("eps", 1e-6))
         aggregation = str(uplift_cfg.get("aggregation", "uid"))
         jf_policy = str(uplift_cfg.get("jf_policy", "actor"))
+        confidence_gate_cfg = uplift_cfg.get("confidence_gate", "none")
+        if isinstance(confidence_gate_cfg, bool):
+            confidence_gate = "wilson" if confidence_gate_cfg else "none"
+        else:
+            confidence_gate = str(confidence_gate_cfg).lower()
+        min_uplift = float(uplift_cfg.get("min_uplift", 0.0))
+        delta = float(uplift_cfg.get("delta", 0.1))
+        z_cfg = uplift_cfg.get("z", None)
+        if isinstance(z_cfg, str) and z_cfg.lower() in {"none", "null", ""}:
+            z_cfg = None
+        z = float(z_cfg) if z_cfg is not None else float(NormalDist().inv_cdf(1.0 - delta / 2.0))
+        shrinkage = str(uplift_cfg.get("shrinkage", "none")).lower()
         solution_aggregation_enabled = aggregation == "solution"
         if num_samples <= 0:
             raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
@@ -945,6 +1013,22 @@ class RayPPOTrainer:
             raise ValueError(
                 "self_distillation.uplift_calibration.aggregation must be one of "
                 f"{{'uid', 'solution'}}, got {aggregation!r}"
+            )
+        if confidence_gate not in {"none", "wilson"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.confidence_gate must be one of "
+                f"{{'none', 'wilson'}}, got {confidence_gate!r}"
+            )
+        if min_uplift < 0:
+            raise ValueError("self_distillation.uplift_calibration.min_uplift must be non-negative")
+        if not 0.0 < delta < 1.0:
+            raise ValueError("self_distillation.uplift_calibration.delta must be in (0, 1)")
+        if z <= 0:
+            raise ValueError("self_distillation.uplift_calibration.z must be positive")
+        if shrinkage not in {"none", "jeffreys"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.shrinkage must be one of "
+                f"{{'none', 'jeffreys'}}, got {shrinkage!r}"
             )
         if jf_policy not in {"actor", "ema_policy"}:
             raise ValueError(
@@ -1182,27 +1266,63 @@ class RayPPOTrainer:
 
         # J_0 来自原始 rollout 的 reward；同一 uid/prompt group 内先求均值，再映射回每个样本。
         baseline_scores = reward_tensor.sum(dim=-1).detach().to(dtype=torch.float32)
+        success_threshold = float(self_distillation_cfg.success_reward_threshold)
+        baseline_successes = (baseline_scores >= success_threshold).to(dtype=torch.float32)
 
         uids = batch.non_tensor_batch["uid"]
         uid_to_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+        uid_to_successes: dict[Any, list[torch.Tensor]] = defaultdict(list)
         for idx, uid in enumerate(uids):
             uid_to_scores[uid].append(baseline_scores[idx])
+            uid_to_successes[uid].append(baseline_successes[idx])
         uid_to_j0 = {uid: torch.stack(scores).mean() for uid, scores in uid_to_scores.items()}
         j0 = torch.stack([uid_to_j0[uid] for uid in uids])
+        uid_to_s0 = {uid: torch.stack(successes).sum() for uid, successes in uid_to_successes.items()}
+        uid_to_m0 = {
+            uid: torch.tensor(float(len(successes)), device=baseline_scores.device, dtype=torch.float32)
+            for uid, successes in uid_to_successes.items()
+        }
+        s0 = torch.stack([uid_to_s0[uid] for uid in uids])
+        m0 = torch.stack([uid_to_m0[uid] for uid in uids])
 
         if solution_aggregation_enabled:
             # aggregation="solution" 时，每个 prompt+teacher context 单独估计 J_f。
             # 没有有效 teacher context 的样本回退到 J_0，使对应 uplift 权重为 0。
             context_to_jf: dict[str, torch.Tensor] = {}
+            context_to_sf: dict[str, torch.Tensor] = {}
+            context_to_mf: dict[str, torch.Tensor] = {}
             if calibration_scores is not None:
                 for context_idx, key in enumerate(unique_context_keys):
-                    context_to_jf[key] = calibration_scores[context_idx].mean()
+                    scores = calibration_scores[context_idx]
+                    context_to_jf[key] = scores.mean()
+                    context_to_sf[key] = (scores >= success_threshold).to(dtype=torch.float32).sum()
+                    context_to_mf[key] = torch.tensor(
+                        float(scores.numel()), device=scores.device, dtype=torch.float32
+                    )
             assert teacher_context_keys is not None
             jf = torch.stack([
                 context_to_jf.get(teacher_context_keys[idx], uid_to_j0[uid])
                 if target_mask_cpu[idx]
                 else uid_to_j0[uid]
                 for idx, uid in enumerate(uids)
+            ])
+            sf = torch.stack([
+                context_to_sf.get(
+                    teacher_context_keys[idx],
+                    torch.tensor(0.0, device=baseline_scores.device, dtype=torch.float32),
+                )
+                if target_mask_cpu[idx]
+                else torch.tensor(0.0, device=baseline_scores.device, dtype=torch.float32)
+                for idx, _uid in enumerate(uids)
+            ])
+            mf = torch.stack([
+                context_to_mf.get(
+                    teacher_context_keys[idx],
+                    torch.tensor(0.0, device=baseline_scores.device, dtype=torch.float32),
+                )
+                if target_mask_cpu[idx]
+                else torch.tensor(0.0, device=baseline_scores.device, dtype=torch.float32)
+                for idx, _uid in enumerate(uids)
             ])
         else:
             # aggregation="uid" 时，在 prompt/group 级别估计 teacher-conditioned value：
@@ -1214,20 +1334,53 @@ class RayPPOTrainer:
                     uid_to_calibration_scores[uids[batch_idx]].append(calibration_scores[calibration_idx])
 
             uid_to_jf = {}
+            uid_to_sf: dict[Any, torch.Tensor] = {}
+            uid_to_mf: dict[Any, torch.Tensor] = {}
             for uid in uid_to_scores:
                 if len(uid_to_calibration_scores[uid]) > 0:
-                    uid_to_jf[uid] = torch.stack(uid_to_calibration_scores[uid]).mean()
+                    uid_scores = torch.cat([scores.reshape(-1) for scores in uid_to_calibration_scores[uid]])
+                    uid_to_jf[uid] = uid_scores.mean()
+                    uid_to_sf[uid] = (uid_scores >= success_threshold).to(dtype=torch.float32).sum()
+                    uid_to_mf[uid] = torch.tensor(
+                        float(uid_scores.numel()), device=uid_scores.device, dtype=torch.float32
+                    )
                 else:
                     # 该 prompt/group 没有 teacher-conditioned target，令 J_f = J_0，
                     # 使最终 uplift 权重恰好为 0。
                     uid_to_jf[uid] = uid_to_j0[uid]
+                    uid_to_sf[uid] = torch.tensor(0.0, device=baseline_scores.device, dtype=torch.float32)
+                    uid_to_mf[uid] = torch.tensor(0.0, device=baseline_scores.device, dtype=torch.float32)
             jf = torch.stack([uid_to_jf[uid] for uid in uids])
+            sf = torch.stack([uid_to_sf[uid] for uid in uids])
+            mf = torch.stack([uid_to_mf[uid] for uid in uids])
 
-        gap = reward_upper_bound - j0
-        # raw_u 衡量 teacher-conditioned rollout 相对原始 rollout 的 reward uplift；
-        # gap 很小时直接置 0，随后裁剪到 [0, 1] 并只保留 self-distillation 有效样本。
-        raw_u = torch.where(gap > eps, (jf - j0) / gap.clamp(min=eps), torch.zeros_like(j0))
-        u = raw_u.clamp(min=0.0, max=1.0)
+        target_mask = target_mask.to(device=j0.device, dtype=j0.dtype)
+        if confidence_gate == "wilson":
+            lf = self._wilson_lower(sf, mf, z)
+            u0 = self._wilson_upper(s0, m0, z)
+            confidence_mask = (lf > (u0 + min_uplift)).to(dtype=j0.dtype, device=j0.device)
+            if shrinkage == "jeffreys":
+                jf_for_weight = reward_upper_bound * (sf + 0.5) / (mf + 1.0).clamp(min=eps)
+                j0_for_weight = reward_upper_bound * (s0 + 0.5) / (m0 + 1.0).clamp(min=eps)
+            else:
+                jf_for_weight = jf
+                j0_for_weight = j0
+            gap = reward_upper_bound - j0_for_weight
+            raw_u = torch.where(
+                gap > eps,
+                (jf_for_weight - j0_for_weight) / gap.clamp(min=eps),
+                torch.zeros_like(j0_for_weight),
+            )
+            u = raw_u.clamp(min=0.0, max=1.0) * confidence_mask
+        else:
+            lf = torch.zeros_like(j0)
+            u0 = torch.zeros_like(j0)
+            confidence_mask = torch.ones_like(j0)
+            gap = reward_upper_bound - j0
+            # raw_u 衡量 teacher-conditioned rollout 相对原始 rollout 的 reward uplift；
+            # gap 很小时直接置 0，随后裁剪到 [0, 1] 并只保留 self-distillation 有效样本。
+            raw_u = torch.where(gap > eps, (jf - j0) / gap.clamp(min=eps), torch.zeros_like(j0))
+            u = raw_u.clamp(min=0.0, max=1.0)
         target_mask = target_mask.to(device=u.device, dtype=u.dtype)
         u = u * target_mask
 
@@ -1266,6 +1419,30 @@ class RayPPOTrainer:
             "self_distillation/uplift_jf_policy_actor": float(jf_policy == "actor"),
             # 当前 step 是否使用 EMA policy 估计 J_f；1 表示启用，0 表示关闭。
             "self_distillation/uplift_jf_policy_ema_policy": float(jf_policy == "ema_policy"),
+            # 当前 step 使用的 uplift confidence gate 类型。
+            "self_distillation/uplift_confidence_gate_wilson": float(confidence_gate == "wilson"),
+            # Wilson gate 的 normal quantile；confidence_gate="none" 时仅用于记录配置。
+            "self_distillation/uplift_confidence_z": z,
+            # Wilson gate 的最小 uplift margin。
+            "self_distillation/uplift_min_uplift": min_uplift,
+            # 当前 step 是否使用 Jeffreys shrinkage mean 计算 gated uplift weight。
+            "self_distillation/uplift_shrinkage_jeffreys": float(shrinkage == "jeffreys"),
+            # teacher-conditioned calibration 成功次数均值。
+            "self_distillation/uplift_sf_mean": sf.mean().item(),
+            # teacher-conditioned calibration 样本数均值。
+            "self_distillation/uplift_mf_mean": mf.mean().item(),
+            # base rollout 成功次数均值。
+            "self_distillation/uplift_s0_mean": s0.mean().item(),
+            # base rollout 样本数均值。
+            "self_distillation/uplift_m0_mean": m0.mean().item(),
+            # Wilson lower bound L_f 均值；confidence_gate="none" 时为 0。
+            "self_distillation/uplift_wilson_lf_mean": lf.mean().item(),
+            # Wilson upper bound U_0 均值；confidence_gate="none" 时为 0。
+            "self_distillation/uplift_wilson_u0_mean": u0.mean().item(),
+            # 通过 confidence gate 的样本占比；confidence_gate="none" 时为 1。
+            "self_distillation/uplift_confidence_gate_pass_fraction": (
+                (confidence_mask * target_mask).float().sum() / target_mask.float().sum().clamp(min=1.0)
+            ).item(),
         }
         return DataProto.from_dict(
             tensors={"self_distillation_u": u},

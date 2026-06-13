@@ -68,6 +68,7 @@ class SelfDistillationConfig(BaseConfig):
         uplift_calibration (dict[str, Any]): 可选的 reward-uplift 校准配置，用于缩放蒸馏损失。设置 aggregation="solution" 时，会按 prompt+teacher context 估计 J_f。
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        grad_diagnostics (dict[str, Any]): Optional debug-only gradient diagnostics for auxiliary objectives.
     """
 
     objective: str = "jsd"
@@ -120,6 +121,18 @@ class SelfDistillationConfig(BaseConfig):
         J_f 的聚合方式。
         - "uid" 表示同一 prompt/group 共享一个 uplift 权重；
         - "solution" 表示按 prompt+teacher context 估计。
+    all_failed_only:
+        是否只在当前 uid/group 全部失败时启用 RUC 蒸馏候选。
+    confidence_gate:
+        reward-uplift 置信门控类型。"none" 保持旧的 positive clipping；"wilson" 使用二值 reward Wilson gate。
+    min_uplift:
+        confidence_gate="wilson" 时要求 teacher 下置信界超过 base 上置信界的最小 uplift。
+    delta/z:
+        Wilson gate 的置信参数。z=None 时由 delta 计算每侧 one-sided 分位数。
+    shrinkage:
+        confidence_gate="wilson" 时的权重均值估计方式。"none" 使用经验均值；"jeffreys" 使用 Jeffreys shrinkage mean。
+    active_only_distillation:
+        是否只对 self_distillation_mask 命中的样本计算 teacher logits 和蒸馏损失。
     """
     uplift_calibration: dict[str, Any] = field(
         default_factory=lambda: {
@@ -129,6 +142,19 @@ class SelfDistillationConfig(BaseConfig):
             "aggregation": "uid",
             "reward_upper_bound": 1.0,
             "eps": 1e-6,
+            "all_failed_only": False,
+            "confidence_gate": "none",
+            "min_uplift": 0.0,
+            "delta": 0.1,
+            "z": None,
+            "shrinkage": "none",
+            "active_only_distillation": False,
+        }
+    )
+    grad_diagnostics: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "every_n_steps": 20,
         }
     )
 
@@ -200,6 +226,35 @@ class SelfDistillationConfig(BaseConfig):
                 "self_distillation.uplift_calibration.jf_policy must be one of "
                 "{'actor', 'ema_policy'}"
             )
+        confidence_gate = self.uplift_calibration.get("confidence_gate", "none")
+        if isinstance(confidence_gate, bool):
+            confidence_gate = "wilson" if confidence_gate else "none"
+        if confidence_gate not in {"none", "wilson"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.confidence_gate must be one of {'none', 'wilson'}"
+            )
+        if self.uplift_calibration.get("min_uplift", 0.0) < 0:
+            raise ValueError("self_distillation.uplift_calibration.min_uplift must be non-negative")
+        delta = self.uplift_calibration.get("delta", 0.1)
+        if not 0.0 < delta < 1.0:
+            raise ValueError("self_distillation.uplift_calibration.delta must be in (0, 1)")
+        z = self.uplift_calibration.get("z", None)
+        if isinstance(z, str) and z.lower() in {"none", "null", ""}:
+            z = None
+        if z is not None and z <= 0:
+            raise ValueError("self_distillation.uplift_calibration.z must be positive or null")
+        if self.uplift_calibration.get("shrinkage", "none") not in {"none", "jeffreys"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.shrinkage must be one of {'none', 'jeffreys'}"
+            )
+        if not isinstance(self.uplift_calibration.get("all_failed_only", False), bool):
+            raise ValueError("self_distillation.uplift_calibration.all_failed_only must be a bool")
+        if not isinstance(self.uplift_calibration.get("active_only_distillation", False), bool):
+            raise ValueError("self_distillation.uplift_calibration.active_only_distillation must be a bool")
+        if not isinstance(self.grad_diagnostics.get("enable", False), bool):
+            raise ValueError("self_distillation.grad_diagnostics.enable must be a bool")
+        if int(self.grad_diagnostics.get("every_n_steps", 20)) <= 0:
+            raise ValueError("self_distillation.grad_diagnostics.every_n_steps must be positive")
 
 
 @dataclass

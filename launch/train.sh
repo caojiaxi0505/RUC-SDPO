@@ -184,6 +184,15 @@ JF_POLICY="${JF_POLICY:-ema_policy}"
 UPLIFT_NUM_SAMPLES="${UPLIFT_NUM_SAMPLES:-1}"
 UPLIFT_AGGREGATION="${UPLIFT_AGGREGATION:-uid}"
 REWARD_UPPER_BOUND="${REWARD_UPPER_BOUND:-1.0}"
+UPLIFT_ALL_FAILED_ONLY="${UPLIFT_ALL_FAILED_ONLY:-False}"
+UPLIFT_CONFIDENCE_GATE="${UPLIFT_CONFIDENCE_GATE:-none}"
+UPLIFT_MIN_UPLIFT="${UPLIFT_MIN_UPLIFT:-0.0}"
+UPLIFT_DELTA="${UPLIFT_DELTA:-0.1}"
+UPLIFT_Z="${UPLIFT_Z:-null}"
+UPLIFT_SHRINKAGE="${UPLIFT_SHRINKAGE:-none}"
+UPLIFT_ACTIVE_ONLY_DISTILLATION="${UPLIFT_ACTIVE_ONLY_DISTILLATION:-False}"
+GRAD_DIAGNOSTICS_ENABLE="${GRAD_DIAGNOSTICS_ENABLE:-False}"
+GRAD_DIAGNOSTICS_EVERY_N_STEPS="${GRAD_DIAGNOSTICS_EVERY_N_STEPS:-20}"
 AUXILIARY_COEF="${AUXILIARY_COEF:-0.02}"
 
 METHOD_ARGS=()
@@ -214,6 +223,15 @@ case "${METHOD}" in
       "actor_rollout_ref.actor.self_distillation.uplift_calibration.num_samples=${UPLIFT_NUM_SAMPLES}"
       "actor_rollout_ref.actor.self_distillation.uplift_calibration.aggregation=${UPLIFT_AGGREGATION}"
       "actor_rollout_ref.actor.self_distillation.uplift_calibration.reward_upper_bound=${REWARD_UPPER_BOUND}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.all_failed_only=${UPLIFT_ALL_FAILED_ONLY}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.confidence_gate=${UPLIFT_CONFIDENCE_GATE}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.min_uplift=${UPLIFT_MIN_UPLIFT}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.delta=${UPLIFT_DELTA}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.z=${UPLIFT_Z}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.shrinkage=${UPLIFT_SHRINKAGE}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.active_only_distillation=${UPLIFT_ACTIVE_ONLY_DISTILLATION}"
+      "actor_rollout_ref.actor.self_distillation.grad_diagnostics.enable=${GRAD_DIAGNOSTICS_ENABLE}"
+      "actor_rollout_ref.actor.self_distillation.grad_diagnostics.every_n_steps=${GRAD_DIAGNOSTICS_EVERY_N_STEPS}"
     )
     ;;
   ruc-sdpo-grpo)
@@ -231,6 +249,15 @@ case "${METHOD}" in
       "actor_rollout_ref.actor.self_distillation.uplift_calibration.num_samples=${UPLIFT_NUM_SAMPLES}"
       "actor_rollout_ref.actor.self_distillation.uplift_calibration.aggregation=${UPLIFT_AGGREGATION}"
       "actor_rollout_ref.actor.self_distillation.uplift_calibration.reward_upper_bound=${REWARD_UPPER_BOUND}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.all_failed_only=${UPLIFT_ALL_FAILED_ONLY}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.confidence_gate=${UPLIFT_CONFIDENCE_GATE}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.min_uplift=${UPLIFT_MIN_UPLIFT}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.delta=${UPLIFT_DELTA}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.z=${UPLIFT_Z}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.shrinkage=${UPLIFT_SHRINKAGE}"
+      "actor_rollout_ref.actor.self_distillation.uplift_calibration.active_only_distillation=${UPLIFT_ACTIVE_ONLY_DISTILLATION}"
+      "actor_rollout_ref.actor.self_distillation.grad_diagnostics.enable=${GRAD_DIAGNOSTICS_ENABLE}"
+      "actor_rollout_ref.actor.self_distillation.grad_diagnostics.every_n_steps=${GRAD_DIAGNOSTICS_EVERY_N_STEPS}"
     )
     ;;
 esac

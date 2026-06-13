@@ -115,6 +115,7 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler = ShardedGradScaler(growth_interval=400)
         else:
             self.scaler = None
+        self._policy_update_step = 0
 
         # Sum of squared probabilities computation (for optimal_token_baseline)
         # Only initialize if calculate_sum_pi_squared config is enabled
@@ -586,6 +587,55 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.step()
         return grad_norm
 
+    def _compute_grad_diagnostics(self, base_loss: torch.Tensor, aux_loss: torch.Tensor) -> dict[str, float]:
+        params = [p for p in self.actor_module.parameters() if p.requires_grad]
+        if len(params) == 0:
+            return {"self_distillation/grad_diagnostics_failed": 1.0}
+
+        try:
+            base_grads = torch.autograd.grad(base_loss, params, retain_graph=True, allow_unused=True)
+            aux_grads = torch.autograd.grad(aux_loss, params, retain_graph=True, allow_unused=True)
+        except RuntimeError as exc:
+            logger.warning("Failed to compute self-distillation gradient diagnostics: %s", exc)
+            return {"self_distillation/grad_diagnostics_failed": 1.0}
+
+        device = base_loss.device
+        dot = torch.zeros((), device=device, dtype=torch.float32)
+        base_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+        aux_norm_sq = torch.zeros((), device=device, dtype=torch.float32)
+
+        for base_grad, aux_grad in zip(base_grads, aux_grads):
+            if base_grad is None and aux_grad is None:
+                continue
+            if base_grad is not None:
+                base_grad = base_grad.detach().to(dtype=torch.float32)
+                base_norm_sq = base_norm_sq + (base_grad * base_grad).sum()
+            if aux_grad is not None:
+                aux_grad = aux_grad.detach().to(dtype=torch.float32)
+                aux_norm_sq = aux_norm_sq + (aux_grad * aux_grad).sum()
+            if base_grad is not None and aux_grad is not None:
+                dot = dot + (base_grad * aux_grad).sum()
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(dot, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(base_norm_sq, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(aux_norm_sq, op=torch.distributed.ReduceOp.SUM)
+
+        eps = torch.tensor(1e-12, device=device, dtype=torch.float32)
+        base_norm = torch.sqrt(base_norm_sq.clamp(min=0.0))
+        aux_norm = torch.sqrt(aux_norm_sq.clamp(min=0.0))
+        cosine = dot / (base_norm * aux_norm + eps)
+        aux_norm_ratio = aux_norm / (base_norm + eps)
+
+        return {
+            "self_distillation/grad_diagnostics_failed": 0.0,
+            "self_distillation/grad_cosine_base_aux": cosine.detach().item(),
+            "self_distillation/grad_conflict_fraction": float(cosine.detach().item() < 0.0),
+            "self_distillation/grad_base_norm": base_norm.detach().item(),
+            "self_distillation/grad_aux_norm": aux_norm.detach().item(),
+            "self_distillation/grad_aux_norm_ratio": aux_norm_ratio.detach().item(),
+        }
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -676,6 +726,7 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        self._policy_update_step += 1
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
@@ -683,7 +734,18 @@ class DataParallelPPOActor(BasePPOActor):
 
         self_distillation_enabled = loss_mode == "sdpo"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        grad_diagnostics_cfg = {}
+        grad_diagnostics_enabled = False
+        compute_grad_diagnostics_this_step = False
         if self_distillation_enabled:
+            grad_diagnostics_cfg = self_distillation_cfg.get("grad_diagnostics", {})
+            grad_diagnostics_enabled = bool(grad_diagnostics_cfg.get("enable", False))
+            grad_diagnostics_every_n_steps = int(grad_diagnostics_cfg.get("every_n_steps", 20))
+            compute_grad_diagnostics_this_step = (
+                grad_diagnostics_enabled
+                and grad_diagnostics_every_n_steps > 0
+                and self._policy_update_step % grad_diagnostics_every_n_steps == 0
+            )
             sdpo_objective = self_distillation_cfg.get("objective", "jsd")
             if sdpo_objective not in {"jsd", "ruc-sdpo", "ruc-sdpo-grpo"}:
                 raise ValueError(f"Unsupported self_distillation.objective: {sdpo_objective!r}")
@@ -777,6 +839,18 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    active_only_distillation = False
+                    distill_indices = None
+                    if self_distillation_enabled:
+                        active_only_distillation = bool(
+                            self_distillation_cfg.get("uplift_calibration", {}).get("active_only_distillation", False)
+                        )
+                        if active_only_distillation:
+                            active_mask = self_distillation_mask.detach().to(dtype=torch.bool)
+                            self_distillation_u = model_inputs.get("self_distillation_u")
+                            if self_distillation_u is not None:
+                                active_mask = active_mask & (self_distillation_u.detach() > 0)
+                            distill_indices = active_mask.nonzero(as_tuple=False).flatten()
                     if self_distillation_enabled:
                         assert not has_multi_modal_inputs, "Multi-modal inputs are not supported for distillation"
 
@@ -826,12 +900,6 @@ class DataParallelPPOActor(BasePPOActor):
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
                     if self_distillation_enabled:
-                        teacher_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_input_ids"],
-                            "attention_mask": model_inputs["teacher_attention_mask"],
-                            "position_ids": model_inputs["teacher_position_ids"],
-                        }
                         if distillation_teacher_policy == "ema_policy":
                             if teacher_regularization != "ema":
                                 raise ValueError(
@@ -846,6 +914,45 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             # Current(pc) 只作为 teacher target 使用，后续 forward 会放在 torch.no_grad() 中。
                             teacher_model = self.actor_module
+
+                        def _distill_select(tensor):
+                            if tensor is None or distill_indices is None:
+                                return tensor
+                            return tensor.index_select(0, distill_indices)
+
+                        distill_empty = distill_indices is not None and distill_indices.numel() == 0
+                        distill_teacher_inputs = None
+                        if not distill_empty:
+                            distill_teacher_inputs = {
+                                "responses": _distill_select(model_inputs["responses"]),
+                                "input_ids": _distill_select(model_inputs["teacher_input_ids"]),
+                                "attention_mask": _distill_select(model_inputs["teacher_attention_mask"]),
+                                "position_ids": _distill_select(model_inputs["teacher_position_ids"]),
+                            }
+                        distill_log_prob = _distill_select(log_prob)
+                        distill_old_log_prob = _distill_select(old_log_prob)
+                        distill_response_mask = _distill_select(response_mask)
+                        distill_student_all_logps = _distill_select(student_all_logps)
+                        distill_student_topk_logps = _distill_select(student_topk_logps)
+                        distill_student_topk_indices = _distill_select(student_topk_indices)
+                        distill_self_distillation_mask = _distill_select(self_distillation_mask)
+                        distill_self_distillation_u = _distill_select(model_inputs.get("self_distillation_u"))
+                        distill_rollout_is_weights = _distill_select(rollout_is_weights)
+                        full_distill_loss_mask = response_mask * self_distillation_mask.unsqueeze(1)
+                        full_distill_batch_num_tokens = None
+                        full_distill_global_batch_size = None
+                        full_distill_loss_scale_factor = None
+                        if active_only_distillation:
+                            if loss_agg_mode == "token-mean":
+                                full_distill_batch_num_tokens = full_distill_loss_mask.sum().clamp(min=1.0)
+                            elif loss_agg_mode in {"seq-mean-token-sum", "seq-mean-token-mean"}:
+                                full_distill_global_batch_size = (
+                                    full_distill_loss_mask.sum(dim=-1) > 0
+                                ).float().sum().clamp(min=1.0)
+                            elif loss_agg_mode == "seq-mean-token-sum-norm":
+                                full_distill_loss_scale_factor = self.config.loss_scale_factor
+                                if full_distill_loss_scale_factor is None:
+                                    full_distill_loss_scale_factor = full_distill_loss_mask.shape[-1]
                         if ruc_sdpo_grpo_enabled:
                             base_loss_mode = self_distillation_cfg.get("auxiliary_base_loss_mode", "vanilla")
                             if base_loss_mode == "sdpo":
@@ -861,71 +968,102 @@ class DataParallelPPOActor(BasePPOActor):
                                 rollout_is_weights=rollout_is_weights,
                             )
                         if ruc_sdpo_grpo_enabled:
-                            with torch.no_grad():
-                                teacher_outputs = self._forward_micro_batch(
-                                    teacher_inputs,
-                                    temperature=temperature,
-                                    calculate_entropy=False,
-                                    return_all_logps=return_all_logps,
-                                    distill_topk=distill_topk,
-                                    topk_indices=student_topk_indices,
-                                    module=teacher_model,
+                            if distill_empty:
+                                ruc_sdpo_loss = base_pg_loss.new_zeros(())
+                                pg_metrics = {
+                                    "self_distillation/unweighted_loss": 0.0,
+                                    "self_distillation/weighted_loss": 0.0,
+                                }
+                            else:
+                                with torch.no_grad():
+                                    teacher_outputs = self._forward_micro_batch(
+                                        distill_teacher_inputs,
+                                        temperature=temperature,
+                                        calculate_entropy=False,
+                                        return_all_logps=return_all_logps,
+                                        distill_topk=distill_topk,
+                                        topk_indices=distill_student_topk_indices,
+                                        module=teacher_model,
+                                    )
+                                teacher_log_prob = teacher_outputs["log_probs"]
+                                teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                                teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                                ruc_sdpo_loss, pg_metrics = compute_self_distillation_loss(
+                                    student_log_probs=distill_log_prob,
+                                    teacher_log_probs=teacher_log_prob,
+                                    response_mask=distill_response_mask,
+                                    self_distillation_config=self_distillation_cfg,
+                                    old_log_probs=distill_old_log_prob,
+                                    student_all_log_probs=distill_student_all_logps,
+                                    teacher_all_log_probs=teacher_all_logps,
+                                    student_topk_log_probs=distill_student_topk_logps,
+                                    teacher_topk_log_probs=teacher_topk_logps,
+                                    self_distillation_mask=distill_self_distillation_mask,
+                                    self_distillation_weights=distill_self_distillation_u,
+                                    loss_agg_mode=loss_agg_mode,
+                                    rollout_is_weights=distill_rollout_is_weights,
+                                    batch_num_tokens=full_distill_batch_num_tokens,
+                                    global_batch_size=full_distill_global_batch_size,
+                                    loss_scale_factor=full_distill_loss_scale_factor,
                                 )
-                            teacher_log_prob = teacher_outputs["log_probs"]
-                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
-                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                            ruc_sdpo_loss, pg_metrics = compute_self_distillation_loss(
-                                student_log_probs=log_prob,
-                                teacher_log_probs=teacher_log_prob,
-                                response_mask=response_mask,
-                                self_distillation_config=self_distillation_cfg,
-                                old_log_probs=old_log_prob,
-                                student_all_log_probs=student_all_logps,
-                                teacher_all_log_probs=teacher_all_logps,
-                                student_topk_log_probs=student_topk_logps,
-                                teacher_topk_log_probs=teacher_topk_logps,
-                                self_distillation_mask=self_distillation_mask,
-                                self_distillation_weights=model_inputs.get("self_distillation_u"),
-                                loss_agg_mode=loss_agg_mode,
-                                rollout_is_weights=rollout_is_weights,
-                            )
                             auxiliary_coef = float(self_distillation_cfg.get("auxiliary_coef", 0.2))
-                            pg_loss = base_pg_loss + auxiliary_coef * ruc_sdpo_loss
+                            scaled_ruc_sdpo_loss = auxiliary_coef * ruc_sdpo_loss
+                            if compute_grad_diagnostics_this_step and not distill_empty:
+                                pg_metrics.update(
+                                    self._compute_grad_diagnostics(
+                                        base_loss=base_pg_loss,
+                                        aux_loss=scaled_ruc_sdpo_loss,
+                                    )
+                                )
+                                pg_metrics["self_distillation/grad_diagnostics_applied"] = 1.0
+                            else:
+                                pg_metrics["self_distillation/grad_diagnostics_applied"] = 0.0
+                            pg_loss = base_pg_loss + scaled_ruc_sdpo_loss
                             pg_metrics.update(base_pg_metrics)
                             pg_metrics["self_distillation/objective_ruc_sdpo_grpo"] = 1.0
                             pg_metrics["self_distillation/auxiliary_coef"] = auxiliary_coef
                             pg_metrics["self_distillation/base_pg_loss"] = base_pg_loss.detach().item()
                             pg_metrics["self_distillation/ruc_sdpo_grpo_aux_loss"] = ruc_sdpo_loss.detach().item()
-                            pg_metrics["self_distillation/ruc_sdpo_grpo_aux_scaled_loss"] = (auxiliary_coef * ruc_sdpo_loss).detach().item()
+                            pg_metrics["self_distillation/ruc_sdpo_grpo_aux_scaled_loss"] = scaled_ruc_sdpo_loss.detach().item()
                         else:
-                            with torch.no_grad():
-                                teacher_outputs = self._forward_micro_batch(
-                                    teacher_inputs,
-                                    temperature=temperature,
-                                    calculate_entropy=False,
-                                    return_all_logps=return_all_logps,
-                                    distill_topk=distill_topk,
-                                    topk_indices=student_topk_indices,
-                                    module=teacher_model,
+                            if distill_empty:
+                                pg_loss = log_prob.sum() * 0.0
+                                pg_metrics = {
+                                    "self_distillation/unweighted_loss": 0.0,
+                                    "self_distillation/weighted_loss": 0.0,
+                                }
+                            else:
+                                with torch.no_grad():
+                                    teacher_outputs = self._forward_micro_batch(
+                                        distill_teacher_inputs,
+                                        temperature=temperature,
+                                        calculate_entropy=False,
+                                        return_all_logps=return_all_logps,
+                                        distill_topk=distill_topk,
+                                        topk_indices=distill_student_topk_indices,
+                                        module=teacher_model,
+                                    )
+                                teacher_log_prob = teacher_outputs["log_probs"]
+                                teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                                teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                                pg_loss, pg_metrics = compute_self_distillation_loss(
+                                    student_log_probs=distill_log_prob,
+                                    teacher_log_probs=teacher_log_prob,
+                                    response_mask=distill_response_mask,
+                                    self_distillation_config=self_distillation_cfg,
+                                    old_log_probs=distill_old_log_prob,
+                                    student_all_log_probs=distill_student_all_logps,
+                                    teacher_all_log_probs=teacher_all_logps,
+                                    student_topk_log_probs=distill_student_topk_logps,
+                                    teacher_topk_log_probs=teacher_topk_logps,
+                                    self_distillation_mask=distill_self_distillation_mask,
+                                    self_distillation_weights=distill_self_distillation_u,
+                                    loss_agg_mode=loss_agg_mode,
+                                    rollout_is_weights=distill_rollout_is_weights,
+                                    batch_num_tokens=full_distill_batch_num_tokens,
+                                    global_batch_size=full_distill_global_batch_size,
+                                    loss_scale_factor=full_distill_loss_scale_factor,
                                 )
-                            teacher_log_prob = teacher_outputs["log_probs"]
-                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
-                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                            pg_loss, pg_metrics = compute_self_distillation_loss(
-                                student_log_probs=log_prob,
-                                teacher_log_probs=teacher_log_prob,
-                                response_mask=response_mask,
-                                self_distillation_config=self_distillation_cfg,
-                                old_log_probs=old_log_prob,
-                                student_all_log_probs=student_all_logps,
-                                teacher_all_log_probs=teacher_all_logps,
-                                student_topk_log_probs=student_topk_logps,
-                                teacher_topk_log_probs=teacher_topk_logps,
-                                self_distillation_mask=self_distillation_mask,
-                                self_distillation_weights=model_inputs.get("self_distillation_u"),
-                                loss_agg_mode=loss_agg_mode,
-                                rollout_is_weights=rollout_is_weights,
-                            )
                             pg_metrics["self_distillation/objective_ruc_sdpo_grpo"] = 0.0
 
                         pg_metrics["self_distillation/distillation_teacher_policy_actor"] = float(
@@ -934,6 +1072,23 @@ class DataParallelPPOActor(BasePPOActor):
                         pg_metrics["self_distillation/distillation_teacher_policy_ema_policy"] = float(
                             distillation_teacher_policy == "ema_policy"
                         )
+                        pg_metrics["self_distillation/active_only_distillation"] = float(active_only_distillation)
+                        pg_metrics["self_distillation/active_distillation_sample_count"] = float(
+                            distill_indices.numel()
+                            if distill_indices is not None
+                            else (self_distillation_mask.detach() > 0).sum().item()
+                        )
+                        pg_metrics["self_distillation/masked_distillation_sample_count"] = float(
+                            (self_distillation_mask.detach() > 0).sum().item()
+                        )
+                        pg_metrics["self_distillation/active_only_full_mask_normalizer"] = float(
+                            active_only_distillation
+                        )
+                        pg_metrics["self_distillation/grad_diagnostics_enabled"] = float(grad_diagnostics_enabled)
+                        pg_metrics["self_distillation/grad_diagnostics_due"] = float(
+                            compute_grad_diagnostics_this_step
+                        )
+                        pg_metrics["self_distillation/policy_update_step"] = float(self._policy_update_step)
                         pg_metrics["self_distillation/empty_target_batch"] = float(self_distillation_mask.sum().item() == 0)
                         micro_batch_metrics.update(pg_metrics)
                     else:

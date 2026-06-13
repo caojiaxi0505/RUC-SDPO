@@ -168,6 +168,27 @@ self_distillation:
     aggregation: uid
     reward_upper_bound: 1.0
     eps: 1e-6
+    # If True, only uid/groups with no successful base rollout are eligible for RUC.
+    all_failed_only: False
+    # Reward-uplift confidence gate. "none" preserves the old positive clipping behavior; "wilson" enables Wilson interval gating.
+    confidence_gate: none
+    # Minimum confidence uplift margin used by confidence_gate="wilson".
+    min_uplift: 0.0
+    # Overall false activation probability target used to derive z when z is null.
+    delta: 0.1
+    # Wilson interval normal quantile. Null derives z from delta.
+    z: null
+    # Uplift weight estimator after confidence gate. "none" uses empirical means; "jeffreys" uses Jeffreys shrinkage means.
+    shrinkage: none
+    # If True, only active self-distillation samples run teacher-logit distillation in the actor update.
+    active_only_distillation: False
+
+  # Debug-only gradient diagnostics for auxiliary objectives.
+  grad_diagnostics:
+    # If True, periodically compute gradient cosine between base policy loss and RUC auxiliary loss.
+    enable: False
+    # Actor update interval for computing diagnostics.
+    every_n_steps: 20
 
   # Reprompting template - available variables: prompt, solution, feedback
   reprompt_template: |-

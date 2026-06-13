@@ -1096,6 +1096,9 @@ def compute_self_distillation_loss(
     self_distillation_weights: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    batch_num_tokens: Optional[torch.Tensor] = None,
+    global_batch_size: Optional[torch.Tensor] = None,
+    loss_scale_factor: Optional[float] = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1184,7 +1187,9 @@ def compute_self_distillation_loss(
         loss_mat=per_token_loss,
         loss_mask=loss_mask,
         loss_agg_mode=loss_agg_mode,
-        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+        batch_num_tokens=batch_num_tokens if batch_num_tokens is not None else loss_mask.sum().clamp(min=1.0),
+        global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
     )
     metrics["self_distillation/unweighted_loss"] = unweighted_loss.detach().item()
 
@@ -1204,7 +1209,9 @@ def compute_self_distillation_loss(
         loss_mat=per_token_loss,
         loss_mask=loss_mask,
         loss_agg_mode=loss_agg_mode,
-        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+        batch_num_tokens=batch_num_tokens if batch_num_tokens is not None else loss_mask.sum().clamp(min=1.0),
+        global_batch_size=global_batch_size,
+        loss_scale_factor=loss_scale_factor,
     )
     metrics["self_distillation/weighted_loss"] = loss.detach().item()
     return loss, metrics
