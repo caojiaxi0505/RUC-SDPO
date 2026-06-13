@@ -141,3 +141,4 @@ datasets/scienceqa
 datasets/taco
 datasets/medmcqa
 eval_outputs/
+outputs_qwen3_8b/
