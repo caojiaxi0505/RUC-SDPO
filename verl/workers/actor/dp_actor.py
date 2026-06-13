@@ -840,6 +840,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
                     self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
                     active_only_distillation = False
+                    active_only_disabled_for_fsdp_teacher = False
                     distill_indices = None
                     if self_distillation_enabled:
                         active_only_distillation = bool(
@@ -914,6 +915,14 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             # Current(pc) 只作为 teacher target 使用，后续 forward 会放在 torch.no_grad() 中。
                             teacher_model = self.actor_module
+
+                        if active_only_distillation and isinstance(teacher_model, (FSDP, FSDPModule)):
+                            # FSDP forward contains collectives whose order must match across ranks. Subsetting
+                            # teacher batches by local active samples can desynchronize ranks, so keep the full
+                            # distillation mask for FSDP teachers and leave active-only as a non-FSDP optimization.
+                            active_only_distillation = False
+                            active_only_disabled_for_fsdp_teacher = True
+                            distill_indices = None
 
                         masked_distillation_sample_count = (self_distillation_mask.detach() > 0).sum()
                         if distill_indices is None:
@@ -1125,6 +1134,9 @@ class DataParallelPPOActor(BasePPOActor):
                             distillation_teacher_policy == "ema_policy"
                         )
                         pg_metrics["self_distillation/active_only_distillation"] = float(active_only_distillation)
+                        pg_metrics["self_distillation/active_only_disabled_for_fsdp_teacher"] = float(
+                            active_only_disabled_for_fsdp_teacher
+                        )
                         pg_metrics["self_distillation/active_distillation_sample_count"] = float(
                             distill_indices.numel()
                             if distill_indices is not None

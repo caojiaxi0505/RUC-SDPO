@@ -97,6 +97,7 @@ run_new_one() {
   echo "#   experiment : ${experiment_name}"
   echo "#   sd(aux_coef): ${AUXILIARY_COEF}"
   echo "#   gate       : all_failed=${UPLIFT_ALL_FAILED_ONLY}, ${UPLIFT_CONFIDENCE_GATE}, tau=${UPLIFT_MIN_UPLIFT}, delta=${UPLIFT_DELTA}, shrinkage=${UPLIFT_SHRINKAGE}"
+  echo "#   active-only: ${UPLIFT_ACTIVE_ONLY_DISTILLATION}"
   echo "#   grad debug : enable=${GRAD_DIAGNOSTICS_ENABLE}, every=${GRAD_DIAGNOSTICS_EVERY_N_STEPS}"
   echo "######################################################################"
 
